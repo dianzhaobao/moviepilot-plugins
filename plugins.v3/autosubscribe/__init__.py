@@ -13,7 +13,7 @@ from app.core.event import eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
-from app.schemas.types import EventType, MediaType
+from app.schemas.types import EventType, MediaSource, MediaType
 
 
 class AutoSubscribe(_PluginBase):
@@ -24,7 +24,7 @@ class AutoSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "subscribe.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -98,18 +98,26 @@ class AutoSubscribe(_PluginBase):
             logger.info(f"[AutoSubscribe] {title} {season_str} 已存在订阅，跳过")
             return
 
-        # 创建订阅
+        # 创建订阅（V3 用 media_source + media_id 显式指定 TMDB 身份；
+        # 注意：add() 不再接受 tmdbid 参数，传了会被静默忽略导致按标题重识别）
         try:
             sid, msg = SubscribeChain().add(
                 title=title,
                 year=str(year),
                 mtype=MediaType.TV,
-                tmdbid=tmdbid,
                 season=int(season) if season else None,
+                media_source=MediaSource.TMDB,
+                media_id=str(tmdbid),
                 message=False,
             )
         except Exception as e:
             logger.error(f"[AutoSubscribe] 创建订阅异常: {e}")
+            self._notify_result(
+                ok=False,
+                title=title,
+                season_str=season_str,
+                detail=f"创建订阅异常：{e}",
+            )
             return
 
         if sid:
@@ -125,6 +133,25 @@ class AutoSubscribe(_PluginBase):
                     logger.warning(f"[AutoSubscribe] 发送通知失败: {e}")
         else:
             logger.warning(f"[AutoSubscribe] 创建订阅失败: {title} {season_str}: {msg}")
+            self._notify_result(
+                ok=False,
+                title=title,
+                season_str=season_str,
+                detail=f"创建订阅失败：{msg}",
+            )
+
+    def _notify_result(self, ok: bool, title: str, season_str: str, detail: str) -> None:
+        """失败时也发一条通知，方便排查（成功通知在调用处单独处理）"""
+        if ok or not self._notify:
+            return
+        try:
+            self.post_message(
+                title="入库自动订阅",
+                text=f"剧集《{title}》{season_str} 自动订阅失败，{detail}",
+                mtype=NotificationType.Plugin,
+            )
+        except Exception as e:
+            logger.warning(f"[AutoSubscribe] 发送失败通知失败: {e}")
 
     # ------------------------------------------------------------------
     # 插件接口
