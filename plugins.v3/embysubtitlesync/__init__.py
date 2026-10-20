@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.5.0"
+    plugin_version = "2.5.1"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -959,7 +959,7 @@ class EmbySubtitleSync(_PluginBase):
     # ------------------------------------------------------------------
 
     _ASSRT_BASE = "https://api.assrt.net/v1"
-    _OS_UA = "MoviePilot EmbySubtitleSync/2.5.0"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.5.1"
 
     @staticmethod
     def _to_float(v) -> float:
@@ -1685,22 +1685,25 @@ class EmbySubtitleSync(_PluginBase):
                             "component": "VCardText",
                             "content": [
                                 {
+                                    # MP 前端 PageRender 只渲染组件对象同级的 text 字段；
+                                    # 写进 props 的 text 只有 VAlert 等自带 text prop 的组件能显示，
+                                    # 普通 div 必须把 text 放在同级（v2.5.1 修复记录条目空白）
                                     "component": "div",
                                     "props": {
                                         "class": "font-weight-bold "
                                                  + ("text-success" if success else "text-error"),
-                                        "text": f"{'✓' if success else '✗'} {entry.get('title', '')}"
-                                                f"{' (' + str(entry.get('year')) + ')' if entry.get('year') else ''}"
-                                                f" [{entry.get('type', '')}]",
                                     },
+                                    "text": f"{'✓' if success else '✗'} {entry.get('title', '')}"
+                                            f"{' (' + str(entry.get('year')) + ')' if entry.get('year') else ''}"
+                                            f" [{entry.get('type', '')}]",
                                 },
                                 {
                                     "component": "div",
                                     "props": {
                                         "class": "text-caption text-medium-emphasis",
-                                        "text": f"{entry.get('time', '')}｜补齐{entry.get('lang', '')}｜"
-                                                f"{entry.get('sub_name', '') or '未找到合适字幕'}",
                                     },
+                                    "text": f"{entry.get('time', '')}｜补齐{entry.get('lang', '')}｜"
+                                            f"{entry.get('sub_name', '') or '未找到合适字幕'}",
                                 },
                             ],
                         }
