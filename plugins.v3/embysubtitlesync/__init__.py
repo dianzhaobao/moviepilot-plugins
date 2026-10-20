@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.3.0"
+    plugin_version = "2.3.1"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -443,7 +443,7 @@ class EmbySubtitleSync(_PluginBase):
                         async for movie in self._iter_movies(client, lib["id"]):
                             if stop:
                                 break
-                            r = await self._process_item(client, movie, "电影", processed, stats)
+                            r = await self._process_item_safe(client, movie, "电影", processed, stats)
                             if r == "limit":
                                 stop = True
                     else:
@@ -453,8 +453,8 @@ class EmbySubtitleSync(_PluginBase):
                             async for ep in self._iter_episodes(client, series["Id"]):
                                 if stop:
                                     break
-                                r = await self._process_item(client, ep, "电视剧", processed, stats,
-                                                             series_item=series)
+                                r = await self._process_item_safe(client, ep, "电视剧", processed, stats,
+                                                                  series_item=series)
                                 if r == "limit":
                                     stop = True
                                     break
@@ -475,6 +475,17 @@ class EmbySubtitleSync(_PluginBase):
                     self.post_message(title="Emby存量字幕补齐", text=summary, mtype=NotificationType.Plugin)
         finally:
             self._running = False
+
+    async def _process_item_safe(self, client: httpx.AsyncClient, item: dict, media_type: str,
+                                 processed: set, stats: dict, series_item: dict | None = None) -> str | None:
+        """_process_item 的隔离包装：单条异常只记失败并跳过，绝不拖垮整轮扫描。"""
+        try:
+            return await self._process_item(client, item, media_type, processed, stats,
+                                            series_item=series_item)
+        except Exception as e:
+            logger.error(f"[EmbySubtitleSync] 处理条目异常（已跳过）: {item.get('Name') or item.get('Id')}: {e}")
+            stats["failed"] += 1
+            return None
 
     async def _process_item(self, client: httpx.AsyncClient, item: dict, media_type: str,
                             processed: set, stats: dict, series_item: dict | None = None) -> str | None:
@@ -803,7 +814,17 @@ class EmbySubtitleSync(_PluginBase):
                 logger.error(f"[EmbySubtitleSync] 下载失败 HTTP {response.status_code if response else 'N/A'}: {target.enclosure}")
                 return False, None
 
-            file_name = TorrentHelper.get_url_filename(response, target.enclosure) or f"{uuid4().hex}.srt"
+            try:
+                file_name = TorrentHelper.get_url_filename(response, target.enclosure) or ""
+            except Exception as e:
+                # MP 核心 get_url_filename 对含中文的 Content-Disposition 文件名
+                # 会抛 latin-1 编码错误（其内部 encode('ISO-8859-1')），兜底改用候选自带文件名
+                logger.warning(f"[EmbySubtitleSync] 解析下载文件名失败，改用候选文件名: {e}")
+                file_name = ""
+            if not file_name or "/" in file_name or "\\" in file_name:
+                file_name = Path(target.file_name or "").name
+            if not file_name:
+                file_name = f"{uuid4().hex}.srt"
             temp_file = work_dir / file_name
             temp_file.write_bytes(response.content)
 
