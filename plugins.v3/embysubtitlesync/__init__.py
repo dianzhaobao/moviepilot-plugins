@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.5.1"
+    plugin_version = "2.6.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -105,6 +105,10 @@ class EmbySubtitleSync(_PluginBase):
         self._os_jwt: str | None = None
         self._os_base_url = "https://api.opensubtitles.com/api/v1"
         self._assrt_dl_times: list[float] = []
+        # v2.6.0 剧集改造（学 CSF）：整季包缓存 + ASSRT 搜索限速/限流熔断
+        self._pack_cache: dict[str, list] = {}
+        self._assrt_last_search = 0.0
+        self._assrt_cooldown_until = 0.0
 
     # ------------------------------------------------------------------
     # 插件生命周期
@@ -431,6 +435,14 @@ class EmbySubtitleSync(_PluginBase):
                     self._dry_run_samples = []
                     logger.info("[EmbySubtitleSync] 当前为仅扫描模式（dry-run）：只统计待补齐清单，不下载字幕")
 
+                # 整季包缓存按轮重置（包文件只在本轮内复用，避免磁盘堆积）
+                self._pack_cache = {}
+                try:
+                    import shutil as _sh
+                    _sh.rmtree(Path(self.get_data_path()) / "season_packs", ignore_errors=True)
+                except Exception:
+                    pass
+
                 processed = self._load_processed()
                 stats = {"checked": 0, "skipped_has_sub": 0, "skipped_foreign": 0,
                          "skipped_processed": 0, "downloaded": 0, "failed": 0,
@@ -536,46 +548,73 @@ class EmbySubtitleSync(_PluginBase):
             processed.add(item_id)
             return None
 
+        # 显示名与剧集上下文：剧集用「剧名 SxxExx」展示与记历史（原单集名如"有罪之人"无从辨认是哪部剧）
+        title = item.get("Name") or Path(local_path).stem
+        disp_title = title
+        tv = None
+        if media_type == "电视剧":
+            _series = series_item or {}
+            _sname = item.get("SeriesName") or _series.get("Name") or title
+            _sn, _epn = item.get("ParentIndexNumber"), item.get("IndexNumber")
+            if _sn is not None and _epn is not None:
+                disp_title = f"{_sname} S{int(_sn):02d}E{int(_epn):02d}"
+                tv = {"season": int(_sn), "episode": int(_epn),
+                      "cache_key": f"{self._norm_title(_sname)}|S{int(_sn):02d}"}
+            else:
+                disp_title = _sname
+        hist_year = item.get("ProductionYear") or (series_item or {}).get("ProductionYear") or ""
+
         # 2.5 dry-run：确认缺字幕且为外语内容后只登记清单，不搜索不下载不标记已处理
-        title_for_log = item.get("Name") or Path(local_path).stem
         if self._dry_run:
             stats["dry_run_candidates"] += 1
             if len(self._dry_run_samples) < 20:
                 yr = item.get("ProductionYear") or ""
-                self._dry_run_samples.append(f"{title_for_log}({yr})[{media_type}]" if yr else f"{title_for_log}[{media_type}]")
-            logger.info(f"[EmbySubtitleSync][dry-run] 待补齐: {title_for_log} 缺 {','.join(need_langs)}")
+                self._dry_run_samples.append(f"{disp_title}({yr})[{media_type}]" if yr else f"{disp_title}[{media_type}]")
+            logger.info(f"[EmbySubtitleSync][dry-run] 待补齐: {disp_title} 缺 {','.join(need_langs)}")
             return None
 
-        # 3. 搜索并下载
-        title = item.get("Name") or Path(local_path).stem
-        keyword = self._build_keyword(item, media_type)
-        logger.info(f"[EmbySubtitleSync] 缺失{','.join(need_langs)}字幕，搜索: {keyword}")
-        try:
-            results = await SearchChain().async_search_subtitles_by_title(title=keyword, page=0)
-        except Exception as e:
-            logger.error(f"[EmbySubtitleSync] 字幕搜索异常 {keyword}: {e}")
-            results = None
+        # 3.0 整季包缓存（CSF 式）：同剧同季已下过的字幕包先在本地挑本集，命中就不联网
+        if tv and self._try_season_cache(tv, local_path, need_langs[0]):
+            stats["downloaded"] += 1
+            logger.info(f"[EmbySubtitleSync] 字幕补齐成功（整季包缓存）: {disp_title}")
+            await self._emby_refresh_item(client, item_id)
+            self._add_history(disp_title, hist_year, media_type,
+                              ",".join(need_langs), "整季包缓存命中", True)
+            processed.add(item_id)
+            return None
 
-        target = self._pick_best(results, set(need_langs), item, media_type) if results else None
+        # 3. 搜索并下载：多标题依次尝试（剧集先原名后中文名——站点字幕多按原名索引）
+        target = None
+        for keyword in self._build_keywords(item, media_type, series_item):
+            logger.info(f"[EmbySubtitleSync] 缺失{','.join(need_langs)}字幕，搜索: {keyword}")
+            try:
+                results = await SearchChain().async_search_subtitles_by_title(title=keyword, page=0)
+            except Exception as e:
+                logger.error(f"[EmbySubtitleSync] 字幕搜索异常 {keyword}: {e}")
+                results = None
+            if results:
+                target = self._pick_best(results, set(need_langs), item, media_type)
+            if target:
+                break
         ok, sub_name = False, None
         if target:
-            ok, sub_name = await self._download_subtitle(target, local_path, need_langs[0])
+            ok, sub_name = await self._download_subtitle(target, local_path, need_langs[0], tv=tv)
         if not ok:
             # 站点搜索无果或下载失败 → 额外字幕源兜底（ASSRT → OpenSubtitles）
             ok, sub_name = await self._try_extra_sources(item, media_type, series_item,
                                                          local_path, need_langs[0])
         if not ok:
-            logger.info(f"[EmbySubtitleSync] 未找到合适字幕: {title}")
+            logger.info(f"[EmbySubtitleSync] 未找到合适字幕: {disp_title}")
             stats["failed"] += 1
-            self._add_history(title, item.get("ProductionYear") or "", media_type,
+            self._add_history(disp_title, hist_year, media_type,
                               ",".join(need_langs), "", False)
             processed.add(item_id)
             return None
 
         stats["downloaded"] += 1
-        logger.info(f"[EmbySubtitleSync] 字幕补齐成功: {title} <- {sub_name}")
+        logger.info(f"[EmbySubtitleSync] 字幕补齐成功: {disp_title} <- {sub_name}")
         await self._emby_refresh_item(client, item_id)
-        self._add_history(title, item.get("ProductionYear") or "", media_type,
+        self._add_history(disp_title, hist_year, media_type,
                           ",".join(need_langs), sub_name or "", True)
         processed.add(item_id)
         if self._request_delay > 0:
@@ -674,19 +713,32 @@ class EmbySubtitleSync(_PluginBase):
     # 字幕搜索与筛选（与 AutoSubtitle 相同的字幕来源）
     # ------------------------------------------------------------------
 
-    def _build_keyword(self, item: dict, media_type: str) -> str:
-        """构造字幕搜索关键词。"""
+    def _build_keywords(self, item: dict, media_type: str,
+                        series_item: dict | None = None) -> list[str]:
+        """构造字幕搜索关键词列表（按优先级依次尝试，命中可下载候选即停）。
+        剧集学 CSF 的多标题检索：先用原名+季集（PT 站字幕多按原名索引，
+        只用中文剧名实测 10 站全 0 结果），再用中文剧名兜底。"""
         if media_type == "电影":
             name = item.get("OriginalTitle") or item.get("Name") or ""
             year = item.get("ProductionYear") or ""
-            return f"{name} {year}".strip()
-        # 剧集：系列名 + SxxExx
-        series = item.get("SeriesName") or ""
-        season = item.get("ParentIndexNumber")
-        ep = item.get("IndexNumber")
-        if season is not None and ep is not None:
-            return f"{series} S{int(season):02d}E{int(ep):02d}".strip()
-        return series.strip()
+            kws = [f"{name} {year}".strip()]
+            cn = item.get("Name") or ""
+            if cn and cn != name:
+                kws.append(f"{cn} {year}".strip())
+            return [k for k in kws if k]
+        # 剧集：系列原名/中文名 + SxxExx
+        series = series_item or {}
+        sname = item.get("SeriesName") or series.get("Name") or ""
+        sorig = series.get("OriginalTitle") or item.get("OriginalTitle") or ""
+        season, ep = item.get("ParentIndexNumber"), item.get("IndexNumber")
+        tag = f"S{int(season):02d}E{int(ep):02d}" if season is not None and ep is not None else ""
+        kws: list[str] = []
+        for base in (sorig, sname):
+            if base:
+                kw = f"{base} {tag}".strip()
+                if kw not in kws:
+                    kws.append(kw)
+        return kws or ([sname] if sname else [])
 
     # 各站点 language 字段格式不统一：多数站给文字（简体中文/English），
     # 馒头给数字代码（实测 25=中文类字幕，标题多为简体中字/双语/Mandarin；
@@ -823,7 +875,8 @@ class EmbySubtitleSync(_PluginBase):
     # 字幕下载与落盘
     # ------------------------------------------------------------------
 
-    async def _download_subtitle(self, target: SubtitleInfo, video_path: str, lang: str) -> tuple[bool, str | None]:
+    async def _download_subtitle(self, target: SubtitleInfo, video_path: str, lang: str,
+                                 tv: dict | None = None) -> tuple[bool, str | None]:
         """下载字幕 → 解压 → 重命名 → 放到视频目录。返回 (成功, 字幕名称)。"""
         sub_name = target.title or target.file_name or "unknown"
         work_dir = Path(self.get_data_path()) / "downloads" / uuid4().hex
@@ -857,21 +910,144 @@ class EmbySubtitleSync(_PluginBase):
             temp_file = work_dir / file_name
             temp_file.write_bytes(response.content)
 
-            if self._place_subtitle(temp_file, work_dir, video_path, lang):
+            if self._place_subtitle(temp_file, work_dir, video_path, lang, tv=tv):
                 return True, sub_name
             return False, None
         finally:
             import shutil
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    def _place_subtitle(self, downloaded_file: Path, work_dir: Path, video_path: str, lang: str) -> bool:
+    # ---------------- 剧集集号解析与整季包（v2.6.0，学 CSF 的包内逐集匹配） ----------------
+
+    _CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                  "六": 6, "七": 7, "八": 8, "九": 9}
+
+    @staticmethod
+    def _cn_to_int(s: str) -> int | None:
+        """中文数字转整数（支持一~九十九，如 十二=12、二十三=23）。"""
+        if not s:
+            return None
+        d = EmbySubtitleSync._CN_DIGITS
+        if s == "十":
+            return 10
+        if "十" in s:
+            a, _, b = s.partition("十")
+            tens = d.get(a, 1) if a else 1
+            ones = d.get(b, 0) if b else 0
+            return tens * 10 + ones
+        return d.get(s)
+
+    @staticmethod
+    def _parse_episode_tag(name: str) -> tuple[int | None, int] | None:
+        """从字幕文件名解析 (季, 集)；季未知时季为 None。解析不到返回 None。
+        覆盖 CSF 常见的集号写法：S01E02、1x02、第5集/第十二集、EP07、裸集号开头。"""
+        low = (name or "").lower()
+        m = re.search(r"s(\d{1,2})[\s._\-]*e(\d{1,3})", low)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        m = re.search(r"(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)", low)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        m = re.search(r"第(\d{1,3})[集話话]", low)
+        if m:
+            return None, int(m.group(1))
+        m = re.search(r"第([一二三四五六七八九十]{1,3})[集話话]", name or "")
+        if m:
+            n = EmbySubtitleSync._cn_to_int(m.group(1))
+            if n:
+                return None, n
+        m = re.search(r"(?<![a-z])ep(\d{1,3})(?!\d)", low)
+        if m:
+            return None, int(m.group(1))
+        m = re.match(r"(\d{1,3})(?:[.\s_\-]|$)", low)
+        if m:
+            return None, int(m.group(1))
+        return None
+
+    def _pick_episode_file(self, files: list, tv: dict | None) -> Path | None:
+        """在字幕文件列表里挑出目标集的文件（CSF 式包内逐集匹配）。
+        精确 (季,集) 命中优先；只有集号且对得上次之；单文件包直接用它。"""
+        if not tv:
+            return files[0] if len(files) == 1 else None
+        s, e = tv["season"], tv["episode"]
+        ep_only = []
+        for f in files:
+            se = self._parse_episode_tag(f.name)
+            if se is None:
+                continue
+            if se[0] is not None and se == (s, e):
+                return f
+            if se[0] is None and se[1] == e:
+                ep_only.append(f)
+        if ep_only:
+            return ep_only[0]
+        if len(files) == 1:
+            return files[0]
+        return None
+
+    def _stash_pack(self, tv: dict, files: list) -> None:
+        """把整包字幕文件存入按「剧+季」缓存，供同季后续集本地挑集、免重复联网下载。"""
+        try:
+            import hashlib
+            import shutil
+            key = hashlib.md5(tv["cache_key"].encode("utf-8")).hexdigest()[:16]
+            cache_dir = Path(self.get_data_path()) / "season_packs" / key
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            merged = {p.name: p for p in self._pack_cache.get(tv["cache_key"], [])}
+            for f in files:
+                dst = cache_dir / f.name
+                try:
+                    if Path(f).resolve() != dst.resolve():
+                        shutil.copyfile(f, dst)
+                except Exception:
+                    continue
+                merged[dst.name] = dst
+            self._pack_cache[tv["cache_key"]] = list(merged.values())
+        except Exception as e:
+            logger.debug(f"[EmbySubtitleSync] 整季包缓存写入失败（忽略）: {e}")
+
+    @staticmethod
+    def _dest_for(video_path: str, lang: str, ext: str) -> Path:
+        lang_tag = ".zh" if lang == "简体中文" else ".cht"
+        return Path(video_path).parent / f"{Path(video_path).stem}{lang_tag}{ext}"
+
+    def _try_season_cache(self, tv: dict, video_path: str, lang: str) -> bool:
+        """先查整季包缓存：挑中本集文件就直接落盘，返回 True。"""
+        files = [Path(f) for f in self._pack_cache.get(tv["cache_key"], []) if Path(f).is_file()]
+        if not files:
+            return False
+        picked = self._pick_episode_file(files, tv)
+        if not picked:
+            return False
+        dest = self._dest_for(video_path, lang, picked.suffix.lower() or ".srt")
+        try:
+            import shutil
+            shutil.copyfile(picked, dest)
+        except Exception as e:
+            logger.error(f"[EmbySubtitleSync] 缓存字幕落盘失败: {e}")
+            return False
+        logger.info(f"[EmbySubtitleSync] 字幕已保存: {dest}")
+        return True
+
+    def _place_subtitle(self, downloaded_file: Path, work_dir: Path, video_path: str, lang: str,
+                        tv: dict | None = None) -> bool:
         """把已下载到 work_dir 的字幕文件（单文件或压缩包）解压、挑选并落盘到视频旁。"""
         sub_files = self._extract_subtitle_files(downloaded_file, work_dir)
         if not sub_files:
             return False
 
-        # 多文件时（如季包）尽量匹配单集
-        if len(sub_files) > 1:
+        # 整季包先整包入缓存（同季后续集可直接命中），再挑本集
+        if tv and len(sub_files) > 1:
+            self._stash_pack(tv, sub_files)
+            picked = self._pick_episode_file(sub_files, tv)
+            if picked is not None:
+                sub_files = [picked]
+            elif len(sub_files) > 1:
+                # 包里挑不出本集：宁可失败也不乱放别集的字幕
+                logger.info(f"[EmbySubtitleSync] 字幕包内未找到 S{tv['season']:02d}E{tv['episode']:02d} 对应文件")
+                return False
+        elif len(sub_files) > 1:
+            # 电影多文件时（如季包误入）尽量按视频名中的 SxxExx 匹配单集
             stem = Path(video_path).stem
             m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", stem)
             if m:
@@ -881,12 +1057,9 @@ class EmbySubtitleSync(_PluginBase):
                     sub_files = matched[:1]
             sub_files = sub_files[:1]
 
-        video_stem = Path(video_path).stem
         src_file = sub_files[0]
         # 保留字幕真实扩展名（.srt/.ass/.ssa/.vtt 等），不要硬编码 .srt
-        ext = src_file.suffix.lower() or ".srt"
-        lang_tag = ".zh" if lang == "简体中文" else ".cht"
-        dest = Path(video_path).parent / f"{video_stem}{lang_tag}{ext}"
+        dest = self._dest_for(video_path, lang, src_file.suffix.lower() or ".srt")
         try:
             # 下载目录（/config）与媒体目录是不同挂载，
             # rename 跨设备会报 Errno 18，必须用复制落盘（copyfile 自带覆盖）
@@ -959,7 +1132,7 @@ class EmbySubtitleSync(_PluginBase):
     # ------------------------------------------------------------------
 
     _ASSRT_BASE = "https://api.assrt.net/v1"
-    _OS_UA = "MoviePilot EmbySubtitleSync/2.5.1"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.6.0"
 
     @staticmethod
     def _to_float(v) -> float:
@@ -1036,7 +1209,8 @@ class EmbySubtitleSync(_PluginBase):
         - 或某分段内嵌目标英文原名，且原名之后紧跟的不是英文字母 → 命中
           （发布名多为"原名+年份+规格"，原名后跟数字/年份属正常；
           若后跟字母，如 "Snow White with the Red Hair"，那是另一部更长的片名，拒绝）。
-        中文名只接受相等、不接受包含（"红发的白雪公主"包含"白雪公主"但并非同一作品）。"""
+        中文名不接受任意包含（"红发的白雪公主"包含"白雪公主"但并非同一作品），
+        只接受相等，或以目标名开头且后跟季集/年份后缀（剧集候选的常态）。"""
         targets = set()
         for t in (ctx.get("name"), ctx.get("original")):
             n = self._norm_title(t or "")
@@ -1045,15 +1219,32 @@ class EmbySubtitleSync(_PluginBase):
         if not targets:
             return True  # 无标题信息可校验时不拦截
         orig = self._norm_title(ctx.get("original") or "")
-        for part in re.split(r"[/|、,，;；·]", text or ""):
+        # 归一化后紧跟目标名的合法后缀：季集标记/年份（剧集候选几乎必然带 SxxExx，
+        # 不放行会把真字幕误杀——v2.6.0 实测教训；仍拒绝"with the Red Hair"式更长片名）
+        _suffix_ok = re.compile(
+            r"(s\d{1,2}(e\d{1,3})?|season\d*|ep\d{1,3}|e\d{1,3}|"
+            r"第[一二三四五六七八九十\d]{1,3}[集季話话]|\d{4})")
+        parts = re.split(r"[/|、,，;；·]", text or "")
+        # 整段兜底：剧名本身含分隔符（如"阿曼达·诺克斯"里的·）时，分段会把剧名拆散，
+        # 整段归一化后仍能前缀命中；整段以目标名开头才可能命中，不削弱防蹭逻辑
+        parts.append(text or "")
+        for part in parts:
             np = self._norm_title(part)
             if np in targets:
                 return True
+            # 前缀命中：分段以目标名开头且其后是季集/年份后缀 → 同一作品
+            # （前缀判定不怕"红发的白雪公主"——它以"红发"开头而非以目标名开头）
+            for t in targets:
+                if np.startswith(t) and _suffix_ok.match(np[len(t):]):
+                    return True
             if len(orig) >= 4:
                 i = np.find(orig)
                 if i >= 0:
-                    after = np[i + len(orig):i + len(orig) + 1]
+                    rest = np[i + len(orig):]
+                    after = rest[:1]
                     if not (after and after.isascii() and after.isalpha()):
+                        return True
+                    if _suffix_ok.match(rest):
                         return True
         return False
 
@@ -1107,9 +1298,13 @@ class EmbySubtitleSync(_PluginBase):
                                  video_path: str, lang: str) -> tuple[bool, str | None]:
         """站点无果时的兜底入口：依次尝试已启用的额外字幕源。"""
         ctx = self._extra_ctx(item, media_type, series_item)
+        tv = None
+        if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
+            tv = {"season": int(ctx["season"]), "episode": int(ctx["episode"]),
+                  "cache_key": f"{self._norm_title(ctx['name'])}|S{int(ctx['season']):02d}"}
         if self._assrt_enabled and self._assrt_token:
             try:
-                ok, name = await self._assrt_fetch(ctx, video_path, lang)
+                ok, name = await self._assrt_fetch(ctx, video_path, lang, tv=tv)
             except Exception as e:
                 logger.error(f"[EmbySubtitleSync] ASSRT 异常: {e}")
                 ok, name = False, None
@@ -1117,7 +1312,7 @@ class EmbySubtitleSync(_PluginBase):
                 return True, name
         if self._opensubtitles_enabled and self._os_api_key and self._os_username and self._os_password:
             try:
-                ok, name = await self._os_fetch(ctx, video_path, lang)
+                ok, name = await self._os_fetch(ctx, video_path, lang, tv=tv)
             except Exception as e:
                 logger.error(f"[EmbySubtitleSync] OpenSubtitles 异常: {e}")
                 ok, name = False, None
@@ -1161,7 +1356,46 @@ class EmbySubtitleSync(_PluginBase):
             return False
         return "繁" in desc or cls._assrt_flag(flags, "langcht")
 
-    async def _assrt_fetch(self, ctx: dict, video_path: str, lang: str) -> tuple[bool, str | None]:
+    async def _assrt_search_gate(self) -> None:
+        """ASSRT 搜索限速：两次搜索至少间隔 4 秒（实测连搜数次即 HTTP 509 限流）。"""
+        import time as _time
+        wait = 4.0 - (_time.monotonic() - self._assrt_last_search)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._assrt_last_search = _time.monotonic()
+
+    def _assrt_trip_cooldown(self, why: str) -> None:
+        """ASSRT 限流熔断：置冷却期，本轮后续条目直接跳过该源，不再逐集撞限流。"""
+        import time as _time
+        self._assrt_cooldown_until = _time.monotonic() + 900
+        logger.warning(f"[EmbySubtitleSync] ASSRT 触发限流（{why}），冷却 15 分钟，本轮后续跳过该源")
+
+    def _assrt_ep_fit(self, ctx: dict, text: str) -> tuple[bool, float]:
+        """剧集候选与目标集的契合度（CSF 式：整季包可用、包内再挑集）：
+        - 含目标集 SxxExx → 可用 +15；
+        - 含整季/全集标记 → 可用 +8（哪怕也带别的集号，多半是季包）；
+        - 明确只有其他单集标记 → 不可用；
+        - 无集号信息（只有剧名等）→ 可用 +0，靠标题校验把关。"""
+        if not ctx.get("is_tv") or ctx.get("season") is None or ctx.get("episode") is None:
+            return True, 0.0
+        low = (text or "").lower()
+        tag = f"s{int(ctx['season']):02d}e{int(ctx['episode']):02d}"
+        if tag in low:
+            return True, 15.0
+        pack = any(m in low for m in ("全集", "整季", "全季", "合集", "complete", "pack"))
+        has_ep = bool(re.search(r"s\d{1,2}e\d{1,3}", low))
+        if has_ep and not pack:
+            return False, 0.0
+        if pack:
+            return True, 8.0
+        return True, 0.0
+
+    async def _assrt_fetch(self, ctx: dict, video_path: str, lang: str,
+                           tv: dict | None = None) -> tuple[bool, str | None]:
+        import time as _time
+        if _time.monotonic() < self._assrt_cooldown_until:
+            logger.debug("[EmbySubtitleSync] ASSRT 处于限流冷却期，跳过")
+            return False, None
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self._assrt_token}"}
         client = AsyncRequestUtils(headers=headers, proxies=settings.PROXY or {})
         queries: list[str] = []
@@ -1169,15 +1403,16 @@ class EmbySubtitleSync(_PluginBase):
             q = (q or "").strip()
             if len(q) >= 2 and q not in queries:
                 queries.append(q)
-        ep_tag = None
-        if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
-            ep_tag = f"s{int(ctx['season']):02d}e{int(ctx['episode']):02d}"
         # 两轮查询的候选汇总后统一打分，避免中文查询先命中弱相关结果就提前收工
         pool: dict[str, dict] = {}
         rejected_mismatch = 0
         for query in queries:
+            await self._assrt_search_gate()
             resp = await client.get_res(f"{self._ASSRT_BASE}/sub/search",
                                         params={"q": query, "cnt": 15, "pos": 0})
+            if resp and resp.status_code == 509:
+                self._assrt_trip_cooldown("HTTP 509")
+                return False, None
             if not resp or resp.status_code != 200:
                 logger.warning(f"[EmbySubtitleSync] ASSRT 搜索失败 HTTP {resp.status_code if resp else 'N/A'}: {query}")
                 continue
@@ -1187,7 +1422,7 @@ class EmbySubtitleSync(_PluginBase):
                 continue
             status = payload.get("status")
             if status == 30900:
-                logger.warning("[EmbySubtitleSync] ASSRT 触发限流（30900），本轮跳过该源")
+                self._assrt_trip_cooldown("30900")
                 return False, None
             if status != 0:
                 logger.warning(f"[EmbySubtitleSync] ASSRT 返回状态 {status}: {query}")
@@ -1199,7 +1434,9 @@ class EmbySubtitleSync(_PluginBase):
                 if not self._assrt_lang_ok(it, lang):
                     continue
                 text = f"{it.get('native_name') or ''} {it.get('videoname') or ''}"
-                if ep_tag and ep_tag not in text.lower():
+                # 集号契合：整季包不再被"SxxExx 必须出现在搜索结果文本"误杀（包内再挑集）
+                fit, fit_bonus = self._assrt_ep_fit(ctx, text)
+                if not fit:
                     continue
                 # 精准匹配：标题必须命中目标作品；候选带年份时必须与目标年份一致
                 if not self._title_matches(ctx, text):
@@ -1209,7 +1446,7 @@ class EmbySubtitleSync(_PluginBase):
                 if cy and ctx["year"] and cy != int(ctx["year"]):
                     rejected_mismatch += 1
                     continue
-                score = self._to_float(it.get("vote_score")) * 10 + self._spec_bonus(ctx, text)
+                score = self._to_float(it.get("vote_score")) * 10 + self._spec_bonus(ctx, text) + fit_bonus
                 if cy and ctx["year"] and cy == int(ctx["year"]):
                     score += 20
                 it["_match_score"] = score
@@ -1251,7 +1488,7 @@ class EmbySubtitleSync(_PluginBase):
                 return False, None
             tmp = work_dir / file_name
             tmp.write_bytes(fres.content)
-            if self._place_subtitle(tmp, work_dir, video_path, lang):
+            if self._place_subtitle(tmp, work_dir, video_path, lang, tv=tv):
                 logger.info(f"[EmbySubtitleSync] ASSRT 字幕补齐: {name}")
                 return True, f"[ASSRT] {name}"
             return False, None
@@ -1315,7 +1552,8 @@ class EmbySubtitleSync(_PluginBase):
             logger.info(f"[EmbySubtitleSync] OpenSubtitles 今日剩余下载额度: {payload.get('remaining')}")
         return payload.get("link"), payload.get("file_name")
 
-    async def _os_fetch(self, ctx: dict, video_path: str, lang: str) -> tuple[bool, str | None]:
+    async def _os_fetch(self, ctx: dict, video_path: str, lang: str,
+                        tv: dict | None = None) -> tuple[bool, str | None]:
         lang_code = "zh-cn" if lang == "简体中文" else "zh-tw"
         client = AsyncRequestUtils(headers=self._os_headers(), proxies=settings.PROXY or {})
         common = {"languages": lang_code, "type": "episode" if ctx["is_tv"] else "movie"}
@@ -1431,7 +1669,7 @@ class EmbySubtitleSync(_PluginBase):
                     return False, None
                 tmp = work_dir / file_name
                 tmp.write_bytes(fres.content)
-                if self._place_subtitle(tmp, work_dir, video_path, lang):
+                if self._place_subtitle(tmp, work_dir, video_path, lang, tv=tv):
                     logger.info(f"[EmbySubtitleSync] OpenSubtitles 字幕补齐: {best['release']}")
                     return True, f"[OpenSubtitles] {best['release']}"
                 return False, None
