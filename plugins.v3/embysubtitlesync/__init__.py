@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.4.0"
+    plugin_version = "2.5.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -709,6 +709,18 @@ class EmbySubtitleSync(_PluginBase):
         "mteam": {"25": "简体中文"},
     }
 
+    # 中英双语标记（v2.5.0 字幕优先级：双语 > 纯简体中文）
+    _BILINGUAL_MARKERS = (
+        "双语", "雙語", "中英", "简英", "繁英", "中英双字", "双字幕",
+        "bilingual", "dual", "chs-eng", "chs_eng", "cht-eng", "cht_eng",
+        "zh-en", "zh_en", "cn-en", "cn_en", "eng-chs", "eng-cht",
+    )
+
+    def _is_bilingual_text(self, *texts: str) -> bool:
+        """文本（语言字段/标题/文件名/发布名）是否表明这是中英双语字幕。"""
+        blob = " ".join(t for t in texts if t).lower()
+        return any(m in blob for m in self._BILINGUAL_MARKERS)
+
     def _resolve_sub_lang(self, sub: SubtitleInfo) -> tuple[str | None, int]:
         """判定一条字幕结果的语言。返回 (语言, 档位)：
         档位 0=字段明确匹配，1=标题关键词兜底，2=语言未知（other/空）。"""
@@ -783,6 +795,10 @@ class EmbySubtitleSync(_PluginBase):
             key=lambda p: self._spec_bonus(spec_ctx, f"{p[0].title or ''} {p[0].file_name or ''}"),
             reverse=True)
         candidates.sort(key=lambda p: p[2])
+        # 字幕优先级（v2.5.0）：中英双语优先于纯简体中文——稳定排序放最后，双语组内保留既有次序
+        candidates.sort(
+            key=lambda p: 0 if self._is_bilingual_text(
+                p[0].language or "", p[0].title or "", p[0].file_name or "") else 1)
         return candidates[0][0]
 
     def _match_episode(self, sub: SubtitleInfo, item: dict) -> bool:
@@ -943,7 +959,7 @@ class EmbySubtitleSync(_PluginBase):
     # ------------------------------------------------------------------
 
     _ASSRT_BASE = "https://api.assrt.net/v1"
-    _OS_UA = "MoviePilot EmbySubtitleSync/2.4.0"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.5.0"
 
     @staticmethod
     def _to_float(v) -> float:
@@ -1112,19 +1128,38 @@ class EmbySubtitleSync(_PluginBase):
     # ---------------- ASSRT（射手网） ----------------
 
     @staticmethod
-    def _assrt_lang_ok(sub: dict, lang: str) -> bool:
+    def _assrt_flag(flags, k: str) -> bool:
+        v = flags.get(k) if isinstance(flags, dict) else None
+        return v in (True, 1, "1") or (isinstance(v, str) and v.lower() in ("true", "yes"))
+
+    @classmethod
+    def _assrt_bilingual(cls, sub: dict) -> bool:
+        """ASSRT 条目是否为中英双语：desc 含双语标记，或语言列表同时含中文与英文。"""
+        lang_data = sub.get("lang") or {}
+        desc = str(lang_data.get("desc") or "")
+        flags = lang_data.get("langlist") or {}
+        if "双语" in desc or "雙語" in desc or "中英" in desc:
+            return True
+        has_zh = cls._assrt_flag(flags, "langchs") or cls._assrt_flag(flags, "langcht")
+        has_en = cls._assrt_flag(flags, "langeng")
+        if has_zh and has_en:
+            return True
+        return any(cls._assrt_flag(flags, k) for k in flags if isinstance(k, str) and "dou" in k)
+
+    @classmethod
+    def _assrt_lang_ok(cls, sub: dict, lang: str) -> bool:
         """按 ASSRT 的 lang.desc / lang.langlist 判断是否为目标中文。"""
         lang_data = sub.get("lang") or {}
         desc = str(lang_data.get("desc") or "")
         flags = lang_data.get("langlist") or {}
-
-        def _flag(k: str) -> bool:
-            v = flags.get(k) if isinstance(flags, dict) else None
-            return v in (True, 1, "1") or (isinstance(v, str) and v.lower() in ("true", "yes"))
-
         if lang == "简体中文":
-            return "简" in desc or _flag("langchs")
-        return "繁" in desc or _flag("langcht")
+            if "简" in desc or cls._assrt_flag(flags, "langchs"):
+                return True
+            # 双语条目 desc 可能只写"双语/中英"不带"简"字：非繁体时按简体接收（双语优先策略需要）
+            if cls._assrt_bilingual(sub) and "繁" not in desc and not cls._assrt_flag(flags, "langcht"):
+                return True
+            return False
+        return "繁" in desc or cls._assrt_flag(flags, "langcht")
 
     async def _assrt_fetch(self, ctx: dict, video_path: str, lang: str) -> tuple[bool, str | None]:
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self._assrt_token}"}
@@ -1182,9 +1217,10 @@ class EmbySubtitleSync(_PluginBase):
         if not pool:
             logger.info(f"[EmbySubtitleSync] ASSRT 无合适字幕（标题/年份不匹配过滤 {rejected_mismatch} 条）")
             return False, None
-        # 机翻靠后，其余按综合分（站点评分+年份+分辨率/版本匹配）降序
+        # 机翻靠后；同档内中英双语优先（v2.5.0），其余按综合分（站点评分+年份+分辨率/版本匹配）降序
         cands = sorted(pool.values(),
                        key=lambda it: (1 if it.get("vote_machine_translate") else 0,
+                                       0 if self._assrt_bilingual(it) else 1,
                                        -self._to_float(it.get("_match_score"))))
         best = cands[0]
         name = str(best.get("native_name") or best.get("videoname") or best["id"])
@@ -1351,6 +1387,8 @@ class EmbySubtitleSync(_PluginBase):
                         "file_name": fname,
                         "release": str(attrs.get("release") or fname),
                         "machine": machine,
+                        "bilingual": self._is_bilingual_text(
+                            str(attrs.get("release") or ""), fname),
                         "downloads": self._to_float(attrs.get("download_count")),
                         "rating": self._to_float(attrs.get("ratings")),
                         "ftitle": str(feature.get("title") or ""),
@@ -1369,8 +1407,9 @@ class EmbySubtitleSync(_PluginBase):
             if not cands:
                 logger.info("[EmbySubtitleSync] OpenSubtitles 无合适字幕")
                 continue
-            # 机翻靠后；同档内优先分辨率/版本匹配，再按下载量、评分降序
+            # 机翻靠后；同档内中英双语优先（v2.5.0），再优先分辨率/版本匹配、下载量、评分
             cands.sort(key=lambda c: (1 if c["machine"] else 0,
+                                      0 if c["bilingual"] else 1,
                                       -self._spec_bonus(ctx, f"{c['release']} {c['file_name']}"),
                                       -c["downloads"], -c["rating"]))
             best = cands[0]
