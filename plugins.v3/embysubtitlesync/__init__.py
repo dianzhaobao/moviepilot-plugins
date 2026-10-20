@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.3.1"
+    plugin_version = "2.4.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -104,6 +104,7 @@ class EmbySubtitleSync(_PluginBase):
         self._os_password = ""
         self._os_jwt: str | None = None
         self._os_base_url = "https://api.opensubtitles.com/api/v1"
+        self._assrt_dl_times: list[float] = []
 
     # ------------------------------------------------------------------
     # 插件生命周期
@@ -735,9 +736,12 @@ class EmbySubtitleSync(_PluginBase):
 
     def _pick_best(self, results: list[SubtitleInfo], need_langs: set[str],
                    item: dict, media_type: str) -> SubtitleInfo | None:
-        """从搜索结果中挑选最佳字幕：语言匹配 → 季集匹配 → 下载量/发布时间排序。"""
+        """从搜索结果中挑选最佳字幕：语言匹配 → 季集匹配 → 年份校验 → 版本/下载量排序。"""
         candidates = []
         rejected = []
+        _res, _tags = self._video_specs(item)
+        spec_ctx = {"res": _res, "src_tags": _tags}
+        item_year = self._to_int(item.get("ProductionYear"))
         for sub in results:
             lang, tier = self._resolve_sub_lang(sub)
             if tier == 2:
@@ -746,6 +750,11 @@ class EmbySubtitleSync(_PluginBase):
                 rejected.append(sub)
                 continue
             if media_type == "电视剧" and not self._match_episode(sub, item):
+                rejected.append(sub)
+                continue
+            # 年份硬校验：候选带年份且与目标不一致 → 拒绝，防同名不同年份误配
+            cy = self._find_year(f"{sub.title or ''} {sub.file_name or ''}")
+            if cy and item_year and cy != item_year:
                 rejected.append(sub)
                 continue
             candidates.append((sub, lang, tier))
@@ -769,6 +778,10 @@ class EmbySubtitleSync(_PluginBase):
             site_order = -(sub.site_order or 0)
             return (grabs, pubdate, site_order)
         candidates.sort(key=sort_key, reverse=True)
+        # 同语言档内优先分辨率/版本与视频一致的候选（稳定排序，不改变既有次序维度）
+        candidates.sort(
+            key=lambda p: self._spec_bonus(spec_ctx, f"{p[0].title or ''} {p[0].file_name or ''}"),
+            reverse=True)
         candidates.sort(key=lambda p: p[2])
         return candidates[0][0]
 
@@ -930,7 +943,7 @@ class EmbySubtitleSync(_PluginBase):
     # ------------------------------------------------------------------
 
     _ASSRT_BASE = "https://api.assrt.net/v1"
-    _OS_UA = "MoviePilot EmbySubtitleSync/2.3.0"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.4.0"
 
     @staticmethod
     def _to_float(v) -> float:
@@ -946,13 +959,121 @@ class EmbySubtitleSync(_PluginBase):
         except (TypeError, ValueError):
             return None
 
+    # ---------------- 匹配精准度工具（v2.4.0） ----------------
+
+    @staticmethod
+    def _norm_title(s: str) -> str:
+        """标题归一化：转小写，只保留字母、数字与汉字（去标点/空格/符号）。"""
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (s or "").lower())
+
+    @staticmethod
+    def _find_year(text: str) -> int | None:
+        m = re.search(r"(?:19|20)\d{2}", text or "")
+        return int(m.group(0)) if m else None
+
+    @staticmethod
+    def _res_bucket(text: str) -> int:
+        """从文本中提取分辨率档（2160/1080/720/480），无则 0。"""
+        t = (text or "").lower()
+        if "2160" in t or "4k" in t or "uhd" in t:
+            return 2160
+        if "1080" in t:
+            return 1080
+        if "720" in t:
+            return 720
+        if "480" in t:
+            return 480
+        return 0
+
+    def _video_specs(self, item: dict) -> tuple[int, set[str]]:
+        """目标视频的 (分辨率档, 版本标签集合)：优先媒体流宽高，其次文件名。"""
+        fname = Path(item.get("Path") or "").name
+        res = 0
+        try:
+            streams = ((item.get("MediaSources") or [{}])[0].get("MediaStreams") or [])
+            for st in streams:
+                if st.get("Type") == "Video":
+                    w = int(st.get("Width") or 0)
+                    if w >= 3000:
+                        res = 2160
+                    elif w >= 1200:
+                        res = 1080
+                    elif w >= 900:
+                        res = 720
+                    elif w >= 600:
+                        res = 480
+                    break
+        except Exception:
+            pass
+        if not res:
+            res = self._res_bucket(fname)
+        tags: set[str] = set()
+        low = fname.lower().replace("-", "")
+        for tag in ("remux", "bluray", "bdrip", "webdl", "webrip", "hdtv", "dvdrip", "uhd"):
+            if tag in low:
+                tags.add(tag)
+        return res, tags
+
+    def _title_matches(self, ctx: dict, text: str) -> bool:
+        """候选文本是否确实命中目标作品（防《赤发白雪姬》蹭《白雪公主》式误配）：
+        - 候选的任一别名分段（按 / | 、,; 分割）归一化后与目标中文名/原名相等 → 命中；
+        - 或某分段内嵌目标英文原名，且原名之后紧跟的不是英文字母 → 命中
+          （发布名多为"原名+年份+规格"，原名后跟数字/年份属正常；
+          若后跟字母，如 "Snow White with the Red Hair"，那是另一部更长的片名，拒绝）。
+        中文名只接受相等、不接受包含（"红发的白雪公主"包含"白雪公主"但并非同一作品）。"""
+        targets = set()
+        for t in (ctx.get("name"), ctx.get("original")):
+            n = self._norm_title(t or "")
+            if len(n) >= 2:
+                targets.add(n)
+        if not targets:
+            return True  # 无标题信息可校验时不拦截
+        orig = self._norm_title(ctx.get("original") or "")
+        for part in re.split(r"[/|、,，;；·]", text or ""):
+            np = self._norm_title(part)
+            if np in targets:
+                return True
+            if len(orig) >= 4:
+                i = np.find(orig)
+                if i >= 0:
+                    after = np[i + len(orig):i + len(orig) + 1]
+                    if not (after and after.isascii() and after.isalpha()):
+                        return True
+        return False
+
+    def _spec_bonus(self, ctx: dict, text: str) -> float:
+        """版本匹配加分：分辨率同档 +30，版本标签（Remux/BluRay/WEB-DL 等）命中每个 +10。"""
+        bonus = 0.0
+        cres = self._res_bucket(text)
+        if ctx.get("res") and cres and cres == ctx["res"]:
+            bonus += 30
+        low = (text or "").lower().replace("-", "")
+        for tag in ctx.get("src_tags") or ():
+            if tag in low:
+                bonus += 10
+        return bonus
+
+    async def _assrt_download_gate(self) -> None:
+        """ASSRT 下载限流：每分钟最多 5 个（站点规则），超限等待窗口滑动后再放行。"""
+        import time as _time
+        now = _time.monotonic()
+        self._assrt_dl_times = [t for t in self._assrt_dl_times if now - t < 60]
+        if len(self._assrt_dl_times) >= 5:
+            wait = 60 - (now - self._assrt_dl_times[0]) + 1
+            logger.info(f"[EmbySubtitleSync] ASSRT 下载限流（5 个/分钟），等待 {wait:.0f} 秒")
+            await asyncio.sleep(wait)
+            now = _time.monotonic()
+            self._assrt_dl_times = [t for t in self._assrt_dl_times if now - t < 60]
+        self._assrt_dl_times.append(now)
+
     def _extra_ctx(self, item: dict, media_type: str, series_item: dict | None) -> dict:
-        """汇总额外源搜索所需的标题/年份/季集/外部 ID。"""
+        """汇总额外源搜索所需的标题/年份/季集/外部 ID/版本规格。"""
         series = series_item or {}
 
         def _pid(d: dict, key: str):
             return (d.get("ProviderIds") or {}).get(key)
 
+        res, tags = self._video_specs(item)
         return {
             "is_tv": media_type == "电视剧",
             "name": item.get("SeriesName") or item.get("Name") or "",
@@ -962,6 +1083,8 @@ class EmbySubtitleSync(_PluginBase):
             "episode": item.get("IndexNumber"),
             "tmdb": _pid(item, "Tmdb") or _pid(series, "Tmdb"),
             "imdb": _pid(item, "Imdb") or _pid(series, "Imdb"),
+            "res": res,
+            "src_tags": tags,
         }
 
     async def _try_extra_sources(self, item: dict, media_type: str, series_item: dict | None,
@@ -1014,6 +1137,9 @@ class EmbySubtitleSync(_PluginBase):
         ep_tag = None
         if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
             ep_tag = f"s{int(ctx['season']):02d}e{int(ctx['episode']):02d}"
+        # 两轮查询的候选汇总后统一打分，避免中文查询先命中弱相关结果就提前收工
+        pool: dict[str, dict] = {}
+        rejected_mismatch = 0
         for query in queries:
             resp = await client.get_res(f"{self._ASSRT_BASE}/sub/search",
                                         params={"q": query, "cnt": 15, "pos": 0})
@@ -1032,58 +1158,70 @@ class EmbySubtitleSync(_PluginBase):
                 logger.warning(f"[EmbySubtitleSync] ASSRT 返回状态 {status}: {query}")
                 continue
             subs = ((payload.get("sub") or {}).get("subs")) or []
-            cands = []
             for it in subs:
                 if not isinstance(it, dict) or not it.get("id"):
                     continue
                 if not self._assrt_lang_ok(it, lang):
                     continue
-                if ep_tag:
-                    hay = f"{it.get('native_name') or ''} {it.get('videoname') or ''}".lower()
-                    if ep_tag not in hay:
-                        continue
-                cands.append(it)
-            if not cands:
-                logger.info(f"[EmbySubtitleSync] ASSRT 无合适字幕: {query}")
-                continue
-            # 机翻靠后，其余按评分降序
-            cands.sort(key=lambda it: (1 if it.get("vote_machine_translate") else 0,
-                                       -self._to_float(it.get("vote_score"))))
-            best = cands[0]
-            name = str(best.get("native_name") or best.get("videoname") or best["id"])
-            dresp = await client.get_res(f"{self._ASSRT_BASE}/sub/detail", params={"id": best["id"]})
-            if not dresp or dresp.status_code != 200:
-                logger.warning("[EmbySubtitleSync] ASSRT 详情请求失败")
+                text = f"{it.get('native_name') or ''} {it.get('videoname') or ''}"
+                if ep_tag and ep_tag not in text.lower():
+                    continue
+                # 精准匹配：标题必须命中目标作品；候选带年份时必须与目标年份一致
+                if not self._title_matches(ctx, text):
+                    rejected_mismatch += 1
+                    continue
+                cy = self._find_year(text)
+                if cy and ctx["year"] and cy != int(ctx["year"]):
+                    rejected_mismatch += 1
+                    continue
+                score = self._to_float(it.get("vote_score")) * 10 + self._spec_bonus(ctx, text)
+                if cy and ctx["year"] and cy == int(ctx["year"]):
+                    score += 20
+                it["_match_score"] = score
+                pool[str(it["id"])] = it
+        if not pool:
+            logger.info(f"[EmbySubtitleSync] ASSRT 无合适字幕（标题/年份不匹配过滤 {rejected_mismatch} 条）")
+            return False, None
+        # 机翻靠后，其余按综合分（站点评分+年份+分辨率/版本匹配）降序
+        cands = sorted(pool.values(),
+                       key=lambda it: (1 if it.get("vote_machine_translate") else 0,
+                                       -self._to_float(it.get("_match_score"))))
+        best = cands[0]
+        name = str(best.get("native_name") or best.get("videoname") or best["id"])
+        dresp = await client.get_res(f"{self._ASSRT_BASE}/sub/detail", params={"id": best["id"]})
+        if not dresp or dresp.status_code != 200:
+            logger.warning("[EmbySubtitleSync] ASSRT 详情请求失败")
+            return False, None
+        try:
+            dpayload = dresp.json()
+        except Exception:
+            return False, None
+        dsubs = ((dpayload.get("sub") or {}).get("subs")) or []
+        detail = next((d for d in dsubs if str(d.get("id")) == str(best["id"])),
+                      dsubs[0] if dsubs else None)
+        url = (detail or {}).get("url")
+        if not url:
+            logger.warning("[EmbySubtitleSync] ASSRT 详情缺少下载链接")
+            return False, None
+        file_name = Path(str((detail or {}).get("filename") or f"assrt-{best['id']}.zip")).name
+        work_dir = Path(self.get_data_path()) / "downloads" / uuid4().hex
+        work_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await self._assrt_download_gate()
+            dl = AsyncRequestUtils(proxies=settings.PROXY or {})
+            fres = await dl.get_res(url)
+            if not fres or fres.status_code != 200 or not fres.content:
+                logger.warning("[EmbySubtitleSync] ASSRT 文件下载失败")
                 return False, None
-            try:
-                dpayload = dresp.json()
-            except Exception:
-                return False, None
-            dsubs = ((dpayload.get("sub") or {}).get("subs")) or []
-            detail = next((d for d in dsubs if str(d.get("id")) == str(best["id"])),
-                          dsubs[0] if dsubs else None)
-            url = (detail or {}).get("url")
-            if not url:
-                logger.warning("[EmbySubtitleSync] ASSRT 详情缺少下载链接")
-                return False, None
-            file_name = Path(str((detail or {}).get("filename") or f"assrt-{best['id']}.zip")).name
-            work_dir = Path(self.get_data_path()) / "downloads" / uuid4().hex
-            work_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                dl = AsyncRequestUtils(proxies=settings.PROXY or {})
-                fres = await dl.get_res(url)
-                if not fres or fres.status_code != 200 or not fres.content:
-                    logger.warning("[EmbySubtitleSync] ASSRT 文件下载失败")
-                    return False, None
-                tmp = work_dir / file_name
-                tmp.write_bytes(fres.content)
-                if self._place_subtitle(tmp, work_dir, video_path, lang):
-                    logger.info(f"[EmbySubtitleSync] ASSRT 字幕补齐: {name}")
-                    return True, f"[ASSRT] {name}"
-                return False, None
-            finally:
-                import shutil
-                shutil.rmtree(work_dir, ignore_errors=True)
+            tmp = work_dir / file_name
+            tmp.write_bytes(fres.content)
+            if self._place_subtitle(tmp, work_dir, video_path, lang):
+                logger.info(f"[EmbySubtitleSync] ASSRT 字幕补齐: {name}")
+                return True, f"[ASSRT] {name}"
+            return False, None
+        finally:
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
         return False, None
 
     # ---------------- OpenSubtitles ----------------
@@ -1145,7 +1283,7 @@ class EmbySubtitleSync(_PluginBase):
         lang_code = "zh-cn" if lang == "简体中文" else "zh-tw"
         client = AsyncRequestUtils(headers=self._os_headers(), proxies=settings.PROXY or {})
         common = {"languages": lang_code, "type": "episode" if ctx["is_tv"] else "movie"}
-        attempts: list[dict] = []
+        attempts: list[tuple[str, dict]] = []
         # 1) 优先按媒体 ID 搜索
         imdb_int = None
         if ctx["imdb"]:
@@ -1167,7 +1305,7 @@ class EmbySubtitleSync(_PluginBase):
             elif tmdb_int:
                 idp["tmdb_id"] = tmdb_int
         if len(idp) > len(common):
-            attempts.append(idp)
+            attempts.append(("id", idp))
         # 2) 英文标题 + 年份搜索
         if ctx["original"]:
             tp = dict(common)
@@ -1176,11 +1314,11 @@ class EmbySubtitleSync(_PluginBase):
                 tp["year"] = int(ctx["year"])
             if ctx["is_tv"] and ctx["season"] is not None:
                 tp["season_number"] = int(ctx["season"])
-            attempts.append(tp)
+            attempts.append(("title", tp))
         ep_tag = None
         if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
             ep_tag = f"s{int(ctx['season']):02d}e{int(ctx['episode']):02d}"
-        for params in attempts:
+        for kind, params in attempts:
             resp = await client.get_res(f"{self._os_base_url}/subtitles", params=params)
             if not resp or resp.status_code != 200:
                 logger.warning(f"[EmbySubtitleSync] OpenSubtitles 搜索失败 HTTP {resp.status_code if resp else 'N/A'}")
@@ -1215,12 +1353,26 @@ class EmbySubtitleSync(_PluginBase):
                         "machine": machine,
                         "downloads": self._to_float(attrs.get("download_count")),
                         "rating": self._to_float(attrs.get("ratings")),
+                        "ftitle": str(feature.get("title") or ""),
+                        "fyear": self._to_int(feature.get("year")),
                     })
+            if kind == "title" and cands:
+                # 标题搜索结果做精准校验：年份冲突直接弃，标题对不上目标作品也弃
+                kept = []
+                for c in cands:
+                    if c["fyear"] and ctx["year"] and c["fyear"] != int(ctx["year"]):
+                        continue
+                    if c["ftitle"] and not self._title_matches(ctx, f"{c['ftitle']} {c['release']}"):
+                        continue
+                    kept.append(c)
+                cands = kept
             if not cands:
                 logger.info("[EmbySubtitleSync] OpenSubtitles 无合适字幕")
                 continue
-            # 机翻靠后，其余按下载量、评分降序
-            cands.sort(key=lambda c: (1 if c["machine"] else 0, -c["downloads"], -c["rating"]))
+            # 机翻靠后；同档内优先分辨率/版本匹配，再按下载量、评分降序
+            cands.sort(key=lambda c: (1 if c["machine"] else 0,
+                                      -self._spec_bonus(ctx, f"{c['release']} {c['file_name']}"),
+                                      -c["downloads"], -c["rating"]))
             best = cands[0]
             if not self._os_jwt and not await self._os_login():
                 return False, None
