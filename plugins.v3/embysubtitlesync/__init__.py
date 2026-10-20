@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -93,6 +93,8 @@ class EmbySubtitleSync(_PluginBase):
         self._run_once = False
         self._notify = False
         self._running = False
+        self._dry_run = True
+        self._dry_run_samples: list[str] = []
 
     # ------------------------------------------------------------------
     # 插件生命周期
@@ -131,6 +133,8 @@ class EmbySubtitleSync(_PluginBase):
             self._cron = (config.get("cron") or "0 3 * * *").strip()
             self._run_once = config.get("run_once", False) or False
             self._notify = config.get("notify", False) or False
+            dry = config.get("dry_run", True)
+            self._dry_run = True if dry is None else bool(dry)
 
             # 清空已处理记录
             if config.get("clear_processed"):
@@ -161,6 +165,7 @@ class EmbySubtitleSync(_PluginBase):
             "path_mappings": "\n".join(f"{s}={d}" for s, d in self._path_mappings),
             "cron": self._cron,
             "notify": self._notify,
+            "dry_run": self._dry_run,
         }
 
     def _run_once_wrapper(self) -> None:
@@ -227,6 +232,20 @@ class EmbySubtitleSync(_PluginBase):
         except Exception as e:
             logger.error(f"[EmbySubtitleSync] Emby 请求异常 {path}: {e}")
             return None
+
+    async def _emby_refresh_item(self, client: httpx.AsyncClient, item_id: str) -> None:
+        """字幕落盘后通知 Emby 刷新该条目，让外挂字幕立即被识别（失败不影响主流程）。"""
+        try:
+            await client.post(
+                f"{self._emby_host}/emby/Items/{item_id}/Refresh",
+                params={"Recursive": "false", "MetadataRefreshMode": "Default",
+                        "ImageRefreshMode": "Default", "ReplaceAllMetadata": "false",
+                        "ReplaceAllImages": "false"},
+                headers={"X-Emby-Token": self._emby_api_key},
+                timeout=30,
+            )
+        except Exception as e:
+            logger.debug(f"[EmbySubtitleSync] Emby 条目刷新失败（忽略）: {e}")
 
     async def _get_libraries(self, client: httpx.AsyncClient) -> list[dict]:
         """获取 Emby 媒体库列表，仅保留电影/电视剧类型。"""
@@ -347,9 +366,27 @@ class EmbySubtitleSync(_PluginBase):
                     return
                 logger.info(f"[EmbySubtitleSync] 开始扫描 {len(libraries)} 个媒体库: {[l['name'] for l in libraries]}")
 
+                # v2: 路径映射必填校验——没配映射直接中止，避免重蹈 v1 全量误标覆辙
+                if not self._path_mappings:
+                    logger.error("[EmbySubtitleSync] 未配置路径映射（path_mappings），扫描中止。请在插件配置中填写，如 /movie_strm=/movie_strm")
+                    return
+                live_dst = 0
+                for _src_p, _dst_p in self._path_mappings:
+                    if Path(_dst_p).exists():
+                        live_dst += 1
+                    else:
+                        logger.warning(f"[EmbySubtitleSync] 映射目标在本机不存在: {_dst_p}（请确认 MP 容器已挂载该目录）")
+                if live_dst == 0:
+                    logger.error("[EmbySubtitleSync] 所有映射目标均不存在，扫描中止。请先给 MP 容器加挂载再运行")
+                    return
+                if self._dry_run:
+                    self._dry_run_samples = []
+                    logger.info("[EmbySubtitleSync] 当前为仅扫描模式（dry-run）：只统计待补齐清单，不下载字幕")
+
                 processed = self._load_processed()
                 stats = {"checked": 0, "skipped_has_sub": 0, "skipped_foreign": 0,
-                         "skipped_processed": 0, "downloaded": 0, "failed": 0}
+                         "skipped_processed": 0, "downloaded": 0, "failed": 0,
+                         "unmapped": 0, "dry_run_candidates": 0}
                 stop = False
 
                 for lib in libraries:
@@ -378,8 +415,13 @@ class EmbySubtitleSync(_PluginBase):
                 summary = (
                     f"扫描完成：检查 {stats['checked']} 个，已有字幕跳过 {stats['skipped_has_sub']} 个，"
                     f"非外语跳过 {stats['skipped_foreign']} 个，已处理跳过 {stats['skipped_processed']} 个，"
-                    f"成功补齐 {stats['downloaded']} 个，失败 {stats['failed']} 个"
+                    f"成功补齐 {stats['downloaded']} 个，失败 {stats['failed']} 个，"
+                    f"路径不可见 {stats['unmapped']} 个"
                 )
+                if self._dry_run:
+                    summary += f"，待补齐（dry-run）{stats['dry_run_candidates']} 个"
+                    if self._dry_run_samples:
+                        summary += "，样本：" + "；".join(self._dry_run_samples[:20])
                 logger.info(f"[EmbySubtitleSync] {summary}")
                 if self._notify:
                     self.post_message(title="Emby存量字幕补齐", text=summary, mtype=NotificationType.Plugin)
@@ -401,8 +443,10 @@ class EmbySubtitleSync(_PluginBase):
         emby_path = item.get("Path") or ""
         local_path = self._map_path(emby_path)
         if not local_path or not Path(local_path).is_file():
-            # 文件在 MoviePilot 本机不可见，无法落盘字幕，跳过
-            processed.add(item_id)
+            # v2 关键修复：文件在本机不可见时只计数报警，绝不标记已处理（v1 因此误标 11 万条）
+            stats["unmapped"] += 1
+            if stats["unmapped"] <= 5:
+                logger.warning(f"[EmbySubtitleSync] 路径不可见，本轮跳过（不标记已处理）: {emby_path} -> {local_path}")
             return None
 
         stats["checked"] += 1
@@ -432,6 +476,16 @@ class EmbySubtitleSync(_PluginBase):
             processed.add(item_id)
             return None
 
+        # 2.5 dry-run：确认缺字幕且为外语内容后只登记清单，不搜索不下载不标记已处理
+        title_for_log = item.get("Name") or Path(local_path).stem
+        if self._dry_run:
+            stats["dry_run_candidates"] += 1
+            if len(self._dry_run_samples) < 20:
+                yr = item.get("ProductionYear") or ""
+                self._dry_run_samples.append(f"{title_for_log}({yr})[{media_type}]" if yr else f"{title_for_log}[{media_type}]")
+            logger.info(f"[EmbySubtitleSync][dry-run] 待补齐: {title_for_log} 缺 {','.join(need_langs)}")
+            return None
+
         # 3. 搜索并下载
         title = item.get("Name") or Path(local_path).stem
         keyword = self._build_keyword(item, media_type)
@@ -455,6 +509,7 @@ class EmbySubtitleSync(_PluginBase):
         if ok:
             stats["downloaded"] += 1
             logger.info(f"[EmbySubtitleSync] 字幕补齐成功: {title} <- {sub_name}")
+            await self._emby_refresh_item(client, item_id)
         else:
             stats["failed"] += 1
         self._add_history(title, item.get("ProductionYear") or "", media_type,
@@ -833,6 +888,7 @@ class EmbySubtitleSync(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            self._col(3, "VSwitch", {"model": "dry_run", "label": "仅扫描报告（不下载）"}),
                             self._col(3, "VSwitch", {"model": "clear_processed", "label": "清空已处理记录"}),
                             self._col(3, "VSwitch", {"model": "clear_history", "label": "清空下载历史"}),
                         ],
@@ -854,6 +910,7 @@ class EmbySubtitleSync(_PluginBase):
             "cron": "0 3 * * *",
             "clear_processed": False,
             "clear_history": False,
+            "dry_run": True,
         }
 
     @staticmethod
