@@ -25,7 +25,8 @@
    "2.2.0": "修复字幕筛选全拒 bug：各站点 language 字段格式不统一（文字/数字代码并存，如馒头 25=中文），改为别名+站点代码+标题关键词多信号识别，并记录被过滤候选便于诊断；修复 max_count=0 被回退成 200 的问题（0 现在表示不限量）。",
    "2.2.1": "修复字幕落盘 Errno 18（跨挂载 rename 失败）：改用复制落盘；落盘文件名保留字幕真实扩展名（.ass/.ssa/.vtt 等），不再硬编码 .srt。",
    "2.3.0": "新增额外字幕源兜底（参考字幕助手 SubtitleAssistant 的源实现）：站点搜索无果时依次尝试 ASSRT（射手网，需在设置中填 Token）与 OpenSubtitles（需 API Key+账号密码，支持按 TMDB/IMDb ID 搜索）；Emby 条目新增 ProviderIds 读取；字幕压缩包新增 rar/7z 解压支持（需系统装有 unrar/7z/unar 之一）。",
-   "2.3.1": "修复含中文字幕文件名导致整轮扫描崩溃：MP 核心 TorrentHelper.get_url_filename 对中文 Content-Disposition 文件名会抛 latin-1 编码错误，改为异常兜底（用候选自带文件名）；单个条目处理异常改为只记失败并跳过，不再中断整轮扫描。"
+   "2.3.1": "修复含中文字幕文件名导致整轮扫描崩溃：MP 核心 TorrentHelper.get_url_filename 对中文 Content-Disposition 文件名会抛 latin-1 编码错误，改为异常兜底（用候选自带文件名）；单个条目处理异常改为只记失败并跳过，不再中断整轮扫描。",
+   "2.4.0": "提高字幕匹配精准度：ASSRT/OpenSubtitles/站点三源统一加标题命中校验（别名相等或原名内嵌且后跟非字母，防《赤发白雪姬》蹭《白雪公主》式误配）与年份硬校验（候选带年份与目标不一致直接弃）；分辨率/版本（Remux/BluRay/WEB-DL 等）纳入打分优先同档；ASSRT 两轮查询候选汇总后统一择优；ASSRT 下载限流 5 个/分钟（站点规则，超限自动等待）。"
   },
   "icon": "subtitle.png",
   "labels": "字幕",
@@ -34,6 +35,6 @@
   "release": true,
   "system_version": ">=3.0.0",
   "v3t": false,
-  "version": "2.3.1"
+  "version": "2.4.0"
  }
 }
