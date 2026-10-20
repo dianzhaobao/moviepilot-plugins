@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.6.0"
+    plugin_version = "2.6.1"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -502,15 +502,24 @@ class EmbySubtitleSync(_PluginBase):
 
     async def _process_item(self, client: httpx.AsyncClient, item: dict, media_type: str,
                             processed: set, stats: dict, series_item: dict | None = None) -> str | None:
-        """处理单个媒体条目。返回 "limit" 表示达到本次处理上限。"""
+        """处理单个媒体条目。返回 "limit" 表示达到本轮成功补齐上限（或兜底上限）。"""
         item_id = str(item.get("Id") or "")
         if not item_id:
             return None
         if item_id in processed:
             stats["skipped_processed"] += 1
             return None
-        if stats["checked"] + stats["downloaded"] + stats["failed"] >= self._max_count and self._max_count > 0:
-            return "limit"
+        if self._max_count > 0:
+            # v2.6.1：上限改为「成功补齐数」——已有字幕/跳过的条目不再占用额度（旧语义按扫描数
+            # 计数，一轮扫到的前 N 条若全有字幕就会 0 下载空转）。另设两个兜底防跑飞：尝试数
+            # （成功+失败）上限与检查数上限，避免整库无果时无限搜索/枚举。
+            got = stats["downloaded"] + (stats["dry_run_candidates"] if self._dry_run else 0)
+            if got >= self._max_count:
+                return "limit"
+            if stats["downloaded"] + stats["failed"] >= self._max_count * 5 + 50:
+                return "limit"
+            if stats["checked"] >= self._max_count * 100 + 1000:
+                return "limit"
 
         emby_path = item.get("Path") or ""
         local_path = self._map_path(emby_path)
@@ -1132,7 +1141,7 @@ class EmbySubtitleSync(_PluginBase):
     # ------------------------------------------------------------------
 
     _ASSRT_BASE = "https://api.assrt.net/v1"
-    _OS_UA = "MoviePilot EmbySubtitleSync/2.6.0"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.6.1"
 
     @staticmethod
     def _to_float(v) -> float:
@@ -1804,7 +1813,7 @@ class EmbySubtitleSync(_PluginBase):
                                 ],
                             },
                             self._col(3, "VTextField", {"model": "request_delay", "label": "请求间隔(秒)", "placeholder": "2"}),
-                            self._col(3, "VTextField", {"model": "max_count", "label": "每次最多处理(个,0=不限)", "placeholder": "200"}),
+                            self._col(3, "VTextField", {"model": "max_count", "label": "每轮最多成功补齐(个,0=不限)", "placeholder": "200"}),
                             self._col(3, "VTextField", {"model": "cron", "label": "定时执行(cron)", "placeholder": "0 3 * * *"}),
                         ],
                     },
