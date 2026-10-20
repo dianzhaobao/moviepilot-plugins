@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -121,7 +121,8 @@ class EmbySubtitleSync(_PluginBase):
             except (ValueError, TypeError):
                 self._request_delay = 2.0
             try:
-                self._max_count = int(config.get("max_count") or 200)
+                _mc = config.get("max_count")
+                self._max_count = 200 if _mc is None else int(_mc)
             except (ValueError, TypeError):
                 self._max_count = 200
             self._path_mappings = []
@@ -649,24 +650,76 @@ class EmbySubtitleSync(_PluginBase):
             return f"{series} S{int(season):02d}E{int(ep):02d}".strip()
         return series.strip()
 
+    # 各站点 language 字段格式不统一：多数站给文字（简体中文/English），
+    # 馒头给数字代码（实测 25=中文类字幕，标题多为简体中字/双语/Mandarin；
+    # 18=阿拉伯语）。以下别名/代码表 + 标题关键词兜底共同判定语言。
+    _SIMP_ALIASES = {
+        "简体中文", "简体", "简中", "简体中文版", "中英双语", "简繁双语",
+        "双语", "双语字幕", "中英", "简英双语", "中文", "中文字幕",
+        "chs", "zh-cn", "zh-hans", "zh_cn", "zh", "cn", "sc",
+        "simplified chinese", "chinese (simplified)", "chinese",
+    }
+    _TRAD_ALIASES = {
+        "繁體中文", "繁体中文", "繁体", "繁體", "繁中",
+        "cht", "zh-tw", "zh-hk", "zh-hant", "zh_tw", "tc",
+        "traditional chinese", "chinese (traditional)",
+    }
+    # 站点数字语言代码（key 为站点名包含的关键词）
+    _SITE_LANG_CODES = {
+        "馒头": {"25": "简体中文"},
+        "m-team": {"25": "简体中文"},
+        "mteam": {"25": "简体中文"},
+    }
+
+    def _resolve_sub_lang(self, sub: SubtitleInfo) -> tuple[str | None, int]:
+        """判定一条字幕结果的语言。返回 (语言, 档位)：
+        档位 0=字段明确匹配，1=标题关键词兜底，2=语言未知（other/空）。"""
+        raw = (sub.language or "").strip()
+        low = raw.lower()
+        if raw in ("简体中文",) or low in self._SIMP_ALIASES:
+            return "简体中文", 0
+        if raw in ("繁體中文",) or low in self._TRAD_ALIASES:
+            return "繁體中文", 0
+        if raw.isdigit():
+            site_name = (sub.site_name or "").lower()
+            for key, table in self._SITE_LANG_CODES.items():
+                if key in site_name and raw in table:
+                    return table[raw], 0
+        if raw in ("", "other", "未知", "unknown", "none"):
+            return None, 2
+        # 字段无法识别时用标题关键词兜底（阿拉伯语等外语标题不含这些词，不会误收）
+        title = f"{sub.title or ''} {sub.file_name or ''}"
+        if any(k in title for k in ("繁體", "繁中", "繁体")) or ".cht" in title.lower():
+            return "繁體中文", 1
+        if any(k in title for k in ("简体", "簡體", "中字", "中文字幕", "双语", "雙語",
+                                    "汉化", "漢化", "压制", "chs")):
+            return "简体中文", 1
+        return None, -1  # 明确的外语，拒绝
+
     def _pick_best(self, results: list[SubtitleInfo], need_langs: set[str],
                    item: dict, media_type: str) -> SubtitleInfo | None:
         """从搜索结果中挑选最佳字幕：语言匹配 → 季集匹配 → 下载量/发布时间排序。"""
         candidates = []
+        rejected = []
         for sub in results:
-            sub_lang = (sub.language or "").strip()
-            if sub_lang in need_langs:
-                lang = sub_lang
-            elif sub_lang in ("other", "") and need_langs:
-                lang = next(iter(need_langs))
-            else:
+            lang, tier = self._resolve_sub_lang(sub)
+            if tier == 2:
+                lang = next(iter(need_langs)) if need_langs else None
+            if lang is None or lang not in need_langs:
+                rejected.append(sub)
                 continue
             if media_type == "电视剧" and not self._match_episode(sub, item):
+                rejected.append(sub)
                 continue
-            candidates.append((sub, lang))
+            candidates.append((sub, lang, tier))
         if not candidates:
+            if rejected:
+                desc = "; ".join(
+                    f"{s.site_name}/lang={s.language!r}/{(s.title or '')[:30]}"
+                    for s in rejected[:8])
+                logger.info(f"[EmbySubtitleSync] 候选字幕均被过滤（语言/季集不匹配）: {desc}")
             return None
-        # 排序：下载量(grabs)降序，发布时间降序
+        # 排序：先按旧规则（下载量/发布时间/站点优先级）降序，再稳定按档位升序
         def sort_key(pair: tuple) -> tuple:
             sub = pair[0]
             grabs = sub.grabs or 0
@@ -679,6 +732,7 @@ class EmbySubtitleSync(_PluginBase):
             site_order = -(sub.site_order or 0)
             return (grabs, pubdate, site_order)
         candidates.sort(key=sort_key, reverse=True)
+        candidates.sort(key=lambda p: p[2])
         return candidates[0][0]
 
     def _match_episode(self, sub: SubtitleInfo, item: dict) -> bool:
