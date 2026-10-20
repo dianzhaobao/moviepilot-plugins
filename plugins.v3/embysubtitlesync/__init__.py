@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -105,11 +105,13 @@ class EmbySubtitleSync(_PluginBase):
             self._enabled = config.get("enabled", False) or False
             self._emby_host = (config.get("emby_host") or "").strip().rstrip("/")
             self._emby_api_key = (config.get("emby_api_key") or "").strip()
-            self._library_names = [
-                line.strip()
-                for line in (config.get("library_names") or "").splitlines()
-                if line.strip()
-            ]
+            _raw_libs = config.get("library_names")
+            if isinstance(_raw_libs, list):
+                self._library_names = [str(x).strip() for x in _raw_libs if str(x).strip()]
+            elif isinstance(_raw_libs, str):
+                self._library_names = [ln.strip() for ln in _raw_libs.splitlines() if ln.strip()]
+            else:
+                self._library_names = []
             self._only_foreign = config.get("only_foreign", True)
             if self._only_foreign is None:
                 self._only_foreign = True
@@ -157,7 +159,7 @@ class EmbySubtitleSync(_PluginBase):
             "enabled": self._enabled,
             "emby_host": self._emby_host,
             "emby_api_key": self._emby_api_key,
-            "library_names": "\n".join(self._library_names),
+            "library_names": list(self._library_names),
             "only_foreign": self._only_foreign,
             "subtitle_langs": self._subtitle_langs,
             "request_delay": self._request_delay,
@@ -246,6 +248,28 @@ class EmbySubtitleSync(_PluginBase):
             )
         except Exception as e:
             logger.debug(f"[EmbySubtitleSync] Emby 条目刷新失败（忽略）: {e}")
+
+    def _fetch_emby_library_names(self) -> list[str] | None:
+        """同步拉取 Emby 媒体库名称（仅电影/电视剧库），供配置表单生成多选项；失败返回 None。"""
+        if not self._emby_host or not getattr(self, "_emby_api_key", ""):
+            return None
+        try:
+            with httpx.Client(timeout=5) as c:
+                resp = c.get(
+                    f"{self._emby_host}/emby/Library/MediaFolders",
+                    headers={"X-Emby-Token": self._emby_api_key},
+                )
+            if resp.status_code != 200:
+                return None
+            names: list[str] = []
+            for item in resp.json().get("Items", []):
+                if (item.get("CollectionType") or "").lower() in ("movies", "tvshows"):
+                    name = (item.get("Name") or "").strip()
+                    if name and name not in names:
+                        names.append(name)
+            return names or None
+        except Exception:
+            return None
 
     async def _get_libraries(self, client: httpx.AsyncClient) -> list[dict]:
         """获取 Emby 媒体库列表，仅保留电影/电视剧类型。"""
@@ -812,6 +836,22 @@ class EmbySubtitleSync(_PluginBase):
     # ------------------------------------------------------------------
 
     def _build_form(self) -> tuple[list[dict], dict[str, Any]]:
+        _lib_names = self._fetch_emby_library_names()
+        if _lib_names:
+            _lib_field = self._col(6, "VSelect", {
+                "model": "library_names",
+                "label": "扫描的媒体库（不选=全部电影/电视剧库）",
+                "multiple": True,
+                "chips": True,
+                "items": [{"title": n, "value": n} for n in _lib_names],
+            })
+        else:
+            _lib_field = self._col(6, "VTextarea", {
+                "model": "library_names",
+                "label": "扫描的媒体库（每行一个，留空=全部电影/电视剧库）",
+                "rows": 3,
+                "placeholder": "电影\n剧集",
+            })
         return [
             {
                 "component": "VForm",
@@ -844,12 +884,7 @@ class EmbySubtitleSync(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            self._col(6, "VTextarea", {
-                                "model": "library_names",
-                                "label": "扫描的媒体库（每行一个，留空=全部电影/电视剧库）",
-                                "rows": 3,
-                                "placeholder": "电影\n剧集",
-                            }),
+                            _lib_field,
                             self._col(6, "VTextarea", {
                                 "model": "path_mappings",
                                 "label": "路径映射（每行一条：Emby路径=本机路径）",
@@ -902,7 +937,7 @@ class EmbySubtitleSync(_PluginBase):
             "run_once": False,
             "emby_host": "",
             "emby_api_key": "",
-            "library_names": "",
+            "library_names": [],
             "path_mappings": "",
             "subtitle_langs": ["简体中文"],
             "request_delay": 2,
