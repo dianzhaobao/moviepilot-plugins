@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.2.0"
+    plugin_version = "2.2.1"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -797,13 +797,16 @@ class EmbySubtitleSync(_PluginBase):
                 sub_files = sub_files[:1]
 
             video_stem = Path(video_path).stem
-            suffix = ".zh.srt" if lang == "简体中文" else ".cht.srt"
-            dest = Path(video_path).parent / f"{video_stem}{suffix}"
+            src_file = sub_files[0]
+            # 保留字幕真实扩展名（.srt/.ass/.ssa/.vtt 等），不要硬编码 .srt
+            ext = src_file.suffix.lower() or ".srt"
+            lang_tag = ".zh" if lang == "简体中文" else ".cht"
+            dest = Path(video_path).parent / f"{video_stem}{lang_tag}{ext}"
             try:
-                # 已存在则覆盖
-                if dest.exists():
-                    dest.unlink()
-                sub_files[0].rename(dest)
+                # 下载目录（/config）与媒体目录（/movie_strm）是不同挂载，
+                # rename 跨设备会报 Errno 18，必须用复制落盘（copyfile 自带覆盖）
+                import shutil
+                shutil.copyfile(src_file, dest)
             except Exception as e:
                 logger.error(f"[EmbySubtitleSync] 字幕落盘失败: {e}")
                 return False, None
