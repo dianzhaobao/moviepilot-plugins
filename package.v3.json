@@ -1,33 +1,34 @@
 {
-  "AutoSubscribe": {
-    "author": "muse",
-    "description": "剧集整理入库完成后，自动按当前季创建订阅",
-    "history": {
-      "1.0.0": "首版：监听 transfer.complete 事件，剧集首次入库整理完成后自动按入库文件的季创建订阅，已订阅过的剧集/季自动跳过。",
-      "1.0.1": "修复 V3 兼容：add() 改用 media_source+media_id 显式指定 TMDB 身份（旧版传 tmdbid 会被静默忽略导致订阅失败）；失败时也发送通知。"
-    },
-    "icon": "subscribe.png",
-    "labels": "订阅",
-    "level": 1,
-    "name": "入库自动订阅",
-    "release": true,
-    "system_version": ">=3.0.0",
-    "v3t": false,
-    "version": "1.0.1"
+ "AutoSubscribe": {
+  "author": "muse",
+  "description": "剧集整理入库完成后，自动按当前季创建订阅",
+  "history": {
+   "1.0.0": "首版：监听 transfer.complete 事件，剧集首次入库整理完成后自动按入库文件的季创建订阅，已订阅过的剧集/季自动跳过。",
+   "1.0.1": "修复 V3 兼容：add() 改用 media_source+media_id 显式指定 TMDB 身份（旧版传 tmdbid 会被静默忽略导致订阅失败）；失败时也发送通知。"
   },
-  "EmbySubtitleSync": {
-    "author": "muse",
-    "description": "扫描 Emby 媒体库，为缺少中文字幕的外语电影/剧集补齐中文字幕",
-    "history": {
-      "1.0.0": "首版：直连 Emby 扫描存量外语电影/剧集，检查内封及外挂中文字幕，缺失时调用 MoviePilot 字幕搜索补齐。"
-    },
-    "icon": "subtitle.png",
-    "labels": "字幕",
-    "level": 1,
-    "name": "Emby存量字幕补齐",
-    "release": true,
-    "system_version": ">=3.0.0",
-    "v3t": false,
-    "version": "1.0.0"
-  }
+  "icon": "subscribe.png",
+  "labels": "订阅",
+  "level": 1,
+  "name": "入库自动订阅",
+  "release": true,
+  "system_version": ">=3.0.0",
+  "v3t": false,
+  "version": "1.0.1"
+ },
+ "EmbySubtitleSync": {
+  "author": "muse",
+  "description": "扫描 Emby 媒体库，为缺少中文字幕的外语电影/剧集补齐中文字幕",
+  "history": {
+   "1.0.0": "首版：直连 Emby 扫描存量外语电影/剧集，检查内封及外挂中文字幕，缺失时调用 MoviePilot 字幕搜索补齐。",
+   "2.0.0": "修复 v1 致命缺陷：路径映射失败/文件不可见不再误标已处理；新增路径映射必填校验与挂载存在检查；新增仅扫描报告（dry-run）模式，先出待补齐清单再真下载；下载成功后自动触发 Emby 条目刷新。"
+  },
+  "icon": "subtitle.png",
+  "labels": "字幕",
+  "level": 1,
+  "name": "Emby存量字幕补齐",
+  "release": true,
+  "system_version": ">=3.0.0",
+  "v3t": false,
+  "version": "2.0.0"
+ }
 }
