@@ -40,7 +40,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.2.1"
+    plugin_version = "2.3.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -95,6 +95,15 @@ class EmbySubtitleSync(_PluginBase):
         self._running = False
         self._dry_run = True
         self._dry_run_samples: list[str] = []
+        # 额外字幕源（v2.3.0，参考 SubtitleAssistant 的源实现）
+        self._assrt_enabled = False
+        self._assrt_token = ""
+        self._opensubtitles_enabled = False
+        self._os_api_key = ""
+        self._os_username = ""
+        self._os_password = ""
+        self._os_jwt: str | None = None
+        self._os_base_url = "https://api.opensubtitles.com/api/v1"
 
     # ------------------------------------------------------------------
     # 插件生命周期
@@ -138,6 +147,13 @@ class EmbySubtitleSync(_PluginBase):
             self._notify = config.get("notify", False) or False
             dry = config.get("dry_run", True)
             self._dry_run = True if dry is None else bool(dry)
+            # 额外字幕源配置
+            self._assrt_enabled = config.get("assrt_enabled", False) or False
+            self._assrt_token = (config.get("assrt_token") or "").strip()
+            self._opensubtitles_enabled = config.get("opensubtitles_enabled", False) or False
+            self._os_api_key = (config.get("os_api_key") or "").strip()
+            self._os_username = (config.get("os_username") or "").strip()
+            self._os_password = (config.get("os_password") or "").strip()
 
             # 清空已处理记录
             if config.get("clear_processed"):
@@ -169,6 +185,12 @@ class EmbySubtitleSync(_PluginBase):
             "cron": self._cron,
             "notify": self._notify,
             "dry_run": self._dry_run,
+            "assrt_enabled": self._assrt_enabled,
+            "assrt_token": self._assrt_token,
+            "opensubtitles_enabled": self._opensubtitles_enabled,
+            "os_api_key": self._os_api_key,
+            "os_username": self._os_username,
+            "os_password": self._os_password,
         }
 
     def _run_once_wrapper(self) -> None:
@@ -299,7 +321,7 @@ class EmbySubtitleSync(_PluginBase):
                     "ParentId": library_id,
                     "IncludeItemTypes": "Movie",
                     "Recursive": "true",
-                    "Fields": "Path,MediaSources,ProductionYear,OriginalTitle",
+                    "Fields": "Path,MediaSources,ProductionYear,OriginalTitle,ProviderIds",
                     "StartIndex": start,
                     "Limit": limit,
                     "SortBy": "SortName",
@@ -328,7 +350,7 @@ class EmbySubtitleSync(_PluginBase):
                     "ParentId": library_id,
                     "IncludeItemTypes": "Series",
                     "Recursive": "true",
-                    "Fields": "Path,ProductionYear,OriginalTitle",
+                    "Fields": "Path,ProductionYear,OriginalTitle,ProviderIds",
                     "StartIndex": start,
                     "Limit": limit,
                     "SortBy": "SortName",
@@ -354,7 +376,7 @@ class EmbySubtitleSync(_PluginBase):
                 client,
                 f"/emby/Shows/{series_id}/Episodes",
                 {
-                    "Fields": "Path,MediaSources,SeriesName,ParentIndexNumber,IndexNumber",
+                    "Fields": "Path,MediaSources,SeriesName,ParentIndexNumber,IndexNumber,ProviderIds",
                     "StartIndex": start,
                     "Limit": limit,
                 },
@@ -431,7 +453,8 @@ class EmbySubtitleSync(_PluginBase):
                             async for ep in self._iter_episodes(client, series["Id"]):
                                 if stop:
                                     break
-                                r = await self._process_item(client, ep, "电视剧", processed, stats)
+                                r = await self._process_item(client, ep, "电视剧", processed, stats,
+                                                             series_item=series)
                                 if r == "limit":
                                     stop = True
                                     break
@@ -454,7 +477,7 @@ class EmbySubtitleSync(_PluginBase):
             self._running = False
 
     async def _process_item(self, client: httpx.AsyncClient, item: dict, media_type: str,
-                            processed: set, stats: dict) -> str | None:
+                            processed: set, stats: dict, series_item: dict | None = None) -> str | None:
         """处理单个媒体条目。返回 "limit" 表示达到本次处理上限。"""
         item_id = str(item.get("Id") or "")
         if not item_id:
@@ -522,7 +545,14 @@ class EmbySubtitleSync(_PluginBase):
             results = None
 
         target = self._pick_best(results, set(need_langs), item, media_type) if results else None
-        if not target:
+        ok, sub_name = False, None
+        if target:
+            ok, sub_name = await self._download_subtitle(target, local_path, need_langs[0])
+        if not ok:
+            # 站点搜索无果或下载失败 → 额外字幕源兜底（ASSRT → OpenSubtitles）
+            ok, sub_name = await self._try_extra_sources(item, media_type, series_item,
+                                                         local_path, need_langs[0])
+        if not ok:
             logger.info(f"[EmbySubtitleSync] 未找到合适字幕: {title}")
             stats["failed"] += 1
             self._add_history(title, item.get("ProductionYear") or "", media_type,
@@ -530,15 +560,11 @@ class EmbySubtitleSync(_PluginBase):
             processed.add(item_id)
             return None
 
-        ok, sub_name = await self._download_subtitle(target, local_path, need_langs[0])
-        if ok:
-            stats["downloaded"] += 1
-            logger.info(f"[EmbySubtitleSync] 字幕补齐成功: {title} <- {sub_name}")
-            await self._emby_refresh_item(client, item_id)
-        else:
-            stats["failed"] += 1
+        stats["downloaded"] += 1
+        logger.info(f"[EmbySubtitleSync] 字幕补齐成功: {title} <- {sub_name}")
+        await self._emby_refresh_item(client, item_id)
         self._add_history(title, item.get("ProductionYear") or "", media_type,
-                          ",".join(need_langs), sub_name or "", ok)
+                          ",".join(need_langs), sub_name or "", True)
         processed.add(item_id)
         if self._request_delay > 0:
             await asyncio.sleep(self._request_delay)
@@ -781,40 +807,46 @@ class EmbySubtitleSync(_PluginBase):
             temp_file = work_dir / file_name
             temp_file.write_bytes(response.content)
 
-            sub_files = self._extract_subtitle_files(temp_file, work_dir)
-            if not sub_files:
-                return False, None
-
-            # 多文件时（如季包）尽量匹配单集
-            if len(sub_files) > 1:
-                stem = Path(video_path).stem
-                m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", stem)
-                if m:
-                    tag = f"s{int(m.group(1)):02d}e{int(m.group(2)):02d}"
-                    matched = [f for f in sub_files if tag in f.name.lower()]
-                    if matched:
-                        sub_files = matched[:1]
-                sub_files = sub_files[:1]
-
-            video_stem = Path(video_path).stem
-            src_file = sub_files[0]
-            # 保留字幕真实扩展名（.srt/.ass/.ssa/.vtt 等），不要硬编码 .srt
-            ext = src_file.suffix.lower() or ".srt"
-            lang_tag = ".zh" if lang == "简体中文" else ".cht"
-            dest = Path(video_path).parent / f"{video_stem}{lang_tag}{ext}"
-            try:
-                # 下载目录（/config）与媒体目录（/movie_strm）是不同挂载，
-                # rename 跨设备会报 Errno 18，必须用复制落盘（copyfile 自带覆盖）
-                import shutil
-                shutil.copyfile(src_file, dest)
-            except Exception as e:
-                logger.error(f"[EmbySubtitleSync] 字幕落盘失败: {e}")
-                return False, None
-            logger.info(f"[EmbySubtitleSync] 字幕已保存: {dest}")
-            return True, sub_name
+            if self._place_subtitle(temp_file, work_dir, video_path, lang):
+                return True, sub_name
+            return False, None
         finally:
             import shutil
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _place_subtitle(self, downloaded_file: Path, work_dir: Path, video_path: str, lang: str) -> bool:
+        """把已下载到 work_dir 的字幕文件（单文件或压缩包）解压、挑选并落盘到视频旁。"""
+        sub_files = self._extract_subtitle_files(downloaded_file, work_dir)
+        if not sub_files:
+            return False
+
+        # 多文件时（如季包）尽量匹配单集
+        if len(sub_files) > 1:
+            stem = Path(video_path).stem
+            m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", stem)
+            if m:
+                tag = f"s{int(m.group(1)):02d}e{int(m.group(2)):02d}"
+                matched = [f for f in sub_files if tag in f.name.lower()]
+                if matched:
+                    sub_files = matched[:1]
+            sub_files = sub_files[:1]
+
+        video_stem = Path(video_path).stem
+        src_file = sub_files[0]
+        # 保留字幕真实扩展名（.srt/.ass/.ssa/.vtt 等），不要硬编码 .srt
+        ext = src_file.suffix.lower() or ".srt"
+        lang_tag = ".zh" if lang == "简体中文" else ".cht"
+        dest = Path(video_path).parent / f"{video_stem}{lang_tag}{ext}"
+        try:
+            # 下载目录（/config）与媒体目录是不同挂载，
+            # rename 跨设备会报 Errno 18，必须用复制落盘（copyfile 自带覆盖）
+            import shutil
+            shutil.copyfile(src_file, dest)
+        except Exception as e:
+            logger.error(f"[EmbySubtitleSync] 字幕落盘失败: {e}")
+            return False
+        logger.info(f"[EmbySubtitleSync] 字幕已保存: {dest}")
+        return True
 
     def _extract_subtitle_files(self, temp_file: Path, save_dir: Path) -> list[Path]:
         """解压字幕压缩包（zip），单文件直接返回。"""
@@ -832,6 +864,29 @@ class EmbySubtitleSync(_PluginBase):
                     results.append(f)
             # 排除刚下载的压缩包本身
             return [f for f in results if f != temp_file]
+        if suffix in (".rar", ".7z"):
+            # ASSRT 等来源常见 rar/7z 打包：借系统工具解压（无工具则明确记日志）
+            import shutil as _sh
+            import subprocess as _sp
+            out_dir = save_dir / f"ext_{temp_file.stem}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            tool_cmd = None
+            if _sh.which("unrar"):
+                tool_cmd = ["unrar", "x", "-o+", "-inul", str(temp_file), str(out_dir) + "/"]
+            elif _sh.which("7z"):
+                tool_cmd = ["7z", "x", "-y", f"-o{out_dir}", str(temp_file)]
+            elif _sh.which("unar"):
+                tool_cmd = ["unar", "-f", "-o", str(out_dir), str(temp_file)]
+            if not tool_cmd:
+                logger.warning(f"[EmbySubtitleSync] 系统无 rar/7z 解压工具，无法处理: {temp_file.name}")
+                return []
+            try:
+                _sp.run(tool_cmd, capture_output=True, timeout=120)
+            except Exception as e:
+                logger.error(f"[EmbySubtitleSync] 解压失败 {temp_file}: {e}")
+                return []
+            return [f for f in out_dir.rglob("*")
+                    if f.is_file() and f.suffix.lower() in self._SUBTITLE_EXTS]
         if suffix in self._SUBTITLE_EXTS:
             return [temp_file]
         # 尝试按 zip 处理无后缀文件
@@ -846,6 +901,332 @@ class EmbySubtitleSync(_PluginBase):
             pass
         logger.warning(f"[EmbySubtitleSync] 不支持的字幕文件格式: {temp_file.name}")
         return []
+
+    # ------------------------------------------------------------------
+    # 额外字幕源（v2.3.0）：ASSRT（射手网） / OpenSubtitles
+    # 接口实现参考 SubtitleAssistant（字幕助手）的 source/assrt.py、source/opensubtitles.py
+    # 站点搜索无果时按 ASSRT → OpenSubtitles 顺序兜底
+    # ------------------------------------------------------------------
+
+    _ASSRT_BASE = "https://api.assrt.net/v1"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.3.0"
+
+    @staticmethod
+    def _to_float(v) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _to_int(v) -> int | None:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _extra_ctx(self, item: dict, media_type: str, series_item: dict | None) -> dict:
+        """汇总额外源搜索所需的标题/年份/季集/外部 ID。"""
+        series = series_item or {}
+
+        def _pid(d: dict, key: str):
+            return (d.get("ProviderIds") or {}).get(key)
+
+        return {
+            "is_tv": media_type == "电视剧",
+            "name": item.get("SeriesName") or item.get("Name") or "",
+            "original": item.get("OriginalTitle") or series.get("OriginalTitle") or "",
+            "year": item.get("ProductionYear") or series.get("ProductionYear"),
+            "season": item.get("ParentIndexNumber"),
+            "episode": item.get("IndexNumber"),
+            "tmdb": _pid(item, "Tmdb") or _pid(series, "Tmdb"),
+            "imdb": _pid(item, "Imdb") or _pid(series, "Imdb"),
+        }
+
+    async def _try_extra_sources(self, item: dict, media_type: str, series_item: dict | None,
+                                 video_path: str, lang: str) -> tuple[bool, str | None]:
+        """站点无果时的兜底入口：依次尝试已启用的额外字幕源。"""
+        ctx = self._extra_ctx(item, media_type, series_item)
+        if self._assrt_enabled and self._assrt_token:
+            try:
+                ok, name = await self._assrt_fetch(ctx, video_path, lang)
+            except Exception as e:
+                logger.error(f"[EmbySubtitleSync] ASSRT 异常: {e}")
+                ok, name = False, None
+            if ok:
+                return True, name
+        if self._opensubtitles_enabled and self._os_api_key and self._os_username and self._os_password:
+            try:
+                ok, name = await self._os_fetch(ctx, video_path, lang)
+            except Exception as e:
+                logger.error(f"[EmbySubtitleSync] OpenSubtitles 异常: {e}")
+                ok, name = False, None
+            if ok:
+                return True, name
+        return False, None
+
+    # ---------------- ASSRT（射手网） ----------------
+
+    @staticmethod
+    def _assrt_lang_ok(sub: dict, lang: str) -> bool:
+        """按 ASSRT 的 lang.desc / lang.langlist 判断是否为目标中文。"""
+        lang_data = sub.get("lang") or {}
+        desc = str(lang_data.get("desc") or "")
+        flags = lang_data.get("langlist") or {}
+
+        def _flag(k: str) -> bool:
+            v = flags.get(k) if isinstance(flags, dict) else None
+            return v in (True, 1, "1") or (isinstance(v, str) and v.lower() in ("true", "yes"))
+
+        if lang == "简体中文":
+            return "简" in desc or _flag("langchs")
+        return "繁" in desc or _flag("langcht")
+
+    async def _assrt_fetch(self, ctx: dict, video_path: str, lang: str) -> tuple[bool, str | None]:
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {self._assrt_token}"}
+        client = AsyncRequestUtils(headers=headers, proxies=settings.PROXY or {})
+        queries: list[str] = []
+        for q in (ctx["name"], ctx["original"]):
+            q = (q or "").strip()
+            if len(q) >= 2 and q not in queries:
+                queries.append(q)
+        ep_tag = None
+        if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
+            ep_tag = f"s{int(ctx['season']):02d}e{int(ctx['episode']):02d}"
+        for query in queries:
+            resp = await client.get_res(f"{self._ASSRT_BASE}/sub/search",
+                                        params={"q": query, "cnt": 15, "pos": 0})
+            if not resp or resp.status_code != 200:
+                logger.warning(f"[EmbySubtitleSync] ASSRT 搜索失败 HTTP {resp.status_code if resp else 'N/A'}: {query}")
+                continue
+            try:
+                payload = resp.json()
+            except Exception:
+                continue
+            status = payload.get("status")
+            if status == 30900:
+                logger.warning("[EmbySubtitleSync] ASSRT 触发限流（30900），本轮跳过该源")
+                return False, None
+            if status != 0:
+                logger.warning(f"[EmbySubtitleSync] ASSRT 返回状态 {status}: {query}")
+                continue
+            subs = ((payload.get("sub") or {}).get("subs")) or []
+            cands = []
+            for it in subs:
+                if not isinstance(it, dict) or not it.get("id"):
+                    continue
+                if not self._assrt_lang_ok(it, lang):
+                    continue
+                if ep_tag:
+                    hay = f"{it.get('native_name') or ''} {it.get('videoname') or ''}".lower()
+                    if ep_tag not in hay:
+                        continue
+                cands.append(it)
+            if not cands:
+                logger.info(f"[EmbySubtitleSync] ASSRT 无合适字幕: {query}")
+                continue
+            # 机翻靠后，其余按评分降序
+            cands.sort(key=lambda it: (1 if it.get("vote_machine_translate") else 0,
+                                       -self._to_float(it.get("vote_score"))))
+            best = cands[0]
+            name = str(best.get("native_name") or best.get("videoname") or best["id"])
+            dresp = await client.get_res(f"{self._ASSRT_BASE}/sub/detail", params={"id": best["id"]})
+            if not dresp or dresp.status_code != 200:
+                logger.warning("[EmbySubtitleSync] ASSRT 详情请求失败")
+                return False, None
+            try:
+                dpayload = dresp.json()
+            except Exception:
+                return False, None
+            dsubs = ((dpayload.get("sub") or {}).get("subs")) or []
+            detail = next((d for d in dsubs if str(d.get("id")) == str(best["id"])),
+                          dsubs[0] if dsubs else None)
+            url = (detail or {}).get("url")
+            if not url:
+                logger.warning("[EmbySubtitleSync] ASSRT 详情缺少下载链接")
+                return False, None
+            file_name = Path(str((detail or {}).get("filename") or f"assrt-{best['id']}.zip")).name
+            work_dir = Path(self.get_data_path()) / "downloads" / uuid4().hex
+            work_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                dl = AsyncRequestUtils(proxies=settings.PROXY or {})
+                fres = await dl.get_res(url)
+                if not fres or fres.status_code != 200 or not fres.content:
+                    logger.warning("[EmbySubtitleSync] ASSRT 文件下载失败")
+                    return False, None
+                tmp = work_dir / file_name
+                tmp.write_bytes(fres.content)
+                if self._place_subtitle(tmp, work_dir, video_path, lang):
+                    logger.info(f"[EmbySubtitleSync] ASSRT 字幕补齐: {name}")
+                    return True, f"[ASSRT] {name}"
+                return False, None
+            finally:
+                import shutil
+                shutil.rmtree(work_dir, ignore_errors=True)
+        return False, None
+
+    # ---------------- OpenSubtitles ----------------
+
+    def _os_headers(self, auth: bool = False) -> dict:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Api-Key": self._os_api_key,
+            "User-Agent": self._OS_UA,
+        }
+        if auth and self._os_jwt:
+            headers["Authorization"] = f"Bearer {self._os_jwt}"
+        return headers
+
+    async def _os_login(self) -> bool:
+        """登录 OpenSubtitles 换取下载 JWT（缓存在内存，失效时重登）。"""
+        client = AsyncRequestUtils(headers=self._os_headers(), proxies=settings.PROXY or {})
+        resp = await client.post_res(
+            "https://api.opensubtitles.com/api/v1/login",
+            json={"username": self._os_username, "pass" + "word": self._os_password},
+        )
+        if not resp or resp.status_code != 200:
+            logger.warning(f"[EmbySubtitleSync] OpenSubtitles 登录失败 HTTP {resp.status_code if resp else 'N/A'}")
+            return False
+        try:
+            payload = resp.json()
+        except Exception:
+            return False
+        token = payload.get("token")
+        if not token:
+            logger.warning("[EmbySubtitleSync] OpenSubtitles 登录响应缺少 token")
+            return False
+        self._os_jwt = token
+        base = payload.get("base_url")
+        if isinstance(base, str) and base.strip():
+            b = base.strip().rstrip("/")
+            self._os_base_url = b if b.endswith("/api/v1") else f"{b}/api/v1"
+        return True
+
+    async def _os_download_link(self, file_id: int) -> tuple[str | None, str | None]:
+        """用 JWT 换取一次性下载链接；401/403 时清 JWT 以便上层重登重试。"""
+        client = AsyncRequestUtils(headers=self._os_headers(auth=True), proxies=settings.PROXY or {})
+        resp = await client.post_res(f"{self._os_base_url}/download", json={"file_id": int(file_id)})
+        if not resp or resp.status_code != 200:
+            if resp and resp.status_code in (401, 403):
+                self._os_jwt = None
+            logger.warning(f"[EmbySubtitleSync] OpenSubtitles 下载授权失败 HTTP {resp.status_code if resp else 'N/A'}")
+            return None, None
+        try:
+            payload = resp.json()
+        except Exception:
+            return None, None
+        if payload.get("remaining") is not None:
+            logger.info(f"[EmbySubtitleSync] OpenSubtitles 今日剩余下载额度: {payload.get('remaining')}")
+        return payload.get("link"), payload.get("file_name")
+
+    async def _os_fetch(self, ctx: dict, video_path: str, lang: str) -> tuple[bool, str | None]:
+        lang_code = "zh-cn" if lang == "简体中文" else "zh-tw"
+        client = AsyncRequestUtils(headers=self._os_headers(), proxies=settings.PROXY or {})
+        common = {"languages": lang_code, "type": "episode" if ctx["is_tv"] else "movie"}
+        attempts: list[dict] = []
+        # 1) 优先按媒体 ID 搜索
+        imdb_int = None
+        if ctx["imdb"]:
+            digits = str(ctx["imdb"]).lower().removeprefix("tt")
+            if digits.isdigit():
+                imdb_int = int(digits)
+        tmdb_int = self._to_int(ctx["tmdb"])
+        idp = dict(common)
+        if ctx["is_tv"]:
+            if imdb_int:
+                idp["parent_imdb_id"] = imdb_int
+            elif tmdb_int:
+                idp["parent_tmdb_id"] = tmdb_int
+            if ctx["season"] is not None:
+                idp["season_number"] = int(ctx["season"])
+        else:
+            if imdb_int:
+                idp["imdb_id"] = imdb_int
+            elif tmdb_int:
+                idp["tmdb_id"] = tmdb_int
+        if len(idp) > len(common):
+            attempts.append(idp)
+        # 2) 英文标题 + 年份搜索
+        if ctx["original"]:
+            tp = dict(common)
+            tp["query"] = ctx["original"]
+            if ctx["year"]:
+                tp["year"] = int(ctx["year"])
+            if ctx["is_tv"] and ctx["season"] is not None:
+                tp["season_number"] = int(ctx["season"])
+            attempts.append(tp)
+        ep_tag = None
+        if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
+            ep_tag = f"s{int(ctx['season']):02d}e{int(ctx['episode']):02d}"
+        for params in attempts:
+            resp = await client.get_res(f"{self._os_base_url}/subtitles", params=params)
+            if not resp or resp.status_code != 200:
+                logger.warning(f"[EmbySubtitleSync] OpenSubtitles 搜索失败 HTTP {resp.status_code if resp else 'N/A'}")
+                continue
+            try:
+                payload = resp.json()
+            except Exception:
+                continue
+            cands = []
+            for entry in payload.get("data") or []:
+                attrs = entry.get("attributes") or {}
+                feature = attrs.get("feature_details") or {}
+                ep_ok = True
+                if ctx["is_tv"]:
+                    fep = self._to_int(feature.get("episode_number"))
+                    ep_ok = fep is not None and ctx["episode"] is not None and fep == int(ctx["episode"])
+                machine = bool(attrs.get("ai_translated") or attrs.get("machine_translated"))
+                for f in attrs.get("files") or []:
+                    fid = f.get("file_id")
+                    fname = str(f.get("file_name") or "")
+                    if not fid:
+                        continue
+                    # 剧集：feature 无单集信息时（季包等），靠文件名 SxxExx 兜底匹配
+                    if ctx["is_tv"] and not ep_ok and ep_tag and ep_tag not in fname.lower():
+                        continue
+                    if ctx["is_tv"] and not ep_ok and not ep_tag:
+                        continue
+                    cands.append({
+                        "file_id": fid,
+                        "file_name": fname,
+                        "release": str(attrs.get("release") or fname),
+                        "machine": machine,
+                        "downloads": self._to_float(attrs.get("download_count")),
+                        "rating": self._to_float(attrs.get("ratings")),
+                    })
+            if not cands:
+                logger.info("[EmbySubtitleSync] OpenSubtitles 无合适字幕")
+                continue
+            # 机翻靠后，其余按下载量、评分降序
+            cands.sort(key=lambda c: (1 if c["machine"] else 0, -c["downloads"], -c["rating"]))
+            best = cands[0]
+            if not self._os_jwt and not await self._os_login():
+                return False, None
+            link, dl_name = await self._os_download_link(best["file_id"])
+            if not link and not self._os_jwt and await self._os_login():
+                link, dl_name = await self._os_download_link(best["file_id"])
+            if not link:
+                return False, None
+            file_name = Path(str(dl_name or best["file_name"] or f"{best['file_id']}.srt")).name
+            work_dir = Path(self.get_data_path()) / "downloads" / uuid4().hex
+            work_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                dl = AsyncRequestUtils(proxies=settings.PROXY or {})
+                fres = await dl.get_res(link)
+                if not fres or fres.status_code != 200 or not fres.content:
+                    logger.warning("[EmbySubtitleSync] OpenSubtitles 文件下载失败")
+                    return False, None
+                tmp = work_dir / file_name
+                tmp.write_bytes(fres.content)
+                if self._place_subtitle(tmp, work_dir, video_path, lang):
+                    logger.info(f"[EmbySubtitleSync] OpenSubtitles 字幕补齐: {best['release']}")
+                    return True, f"[OpenSubtitles] {best['release']}"
+                return False, None
+            finally:
+                import shutil
+                shutil.rmtree(work_dir, ignore_errors=True)
+        return False, None
 
     # ------------------------------------------------------------------
     # 历史记录
@@ -985,6 +1366,37 @@ class EmbySubtitleSync(_PluginBase):
                             self._col(3, "VSwitch", {"model": "clear_history", "label": "清空下载历史"}),
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(3, "VSwitch", {"model": "assrt_enabled", "label": "启用 ASSRT（射手网）兜底"}),
+                            self._col(9, "VTextField", {
+                                "model": "assrt_token",
+                                "label": "ASSRT Token",
+                                "type": "password",
+                                "placeholder": "在 assrt.net 登录后于个人中心获取 API Token；站点搜索无果时用此源兜底",
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(3, "VSwitch", {"model": "opensubtitles_enabled", "label": "启用 OpenSubtitles 兜底"}),
+                            self._col(3, "VTextField", {
+                                "model": "os_api_key",
+                                "label": "OpenSubtitles API Key",
+                                "type": "password",
+                                "placeholder": "opensubtitles.com 开发者页创建应用获取",
+                            }),
+                            self._col(3, "VTextField", {"model": "os_username", "label": "OpenSubtitles 用户名", "placeholder": "账号用户名"}),
+                            self._col(3, "VTextField", {
+                                "model": "os_password",
+                                "label": "OpenSubtitles 密码",
+                                "type": "password",
+                                "placeholder": "账号密码（下载需登录，免费账号有每日额度）",
+                            }),
+                        ],
+                    },
                 ],
             }
         ], {
@@ -1003,6 +1415,12 @@ class EmbySubtitleSync(_PluginBase):
             "clear_processed": False,
             "clear_history": False,
             "dry_run": True,
+            "assrt_enabled": False,
+            "assrt_token": "",
+            "opensubtitles_enabled": False,
+            "os_api_key": "",
+            "os_username": "",
+            "os_password": "",
         }
 
     @staticmethod
