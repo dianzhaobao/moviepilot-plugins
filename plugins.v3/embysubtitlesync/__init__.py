@@ -41,7 +41,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.8.0"
+    plugin_version = "2.9.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -1198,7 +1198,7 @@ class EmbySubtitleSync(_PluginBase):
     # ------------------------------------------------------------------
 
     _ASSRT_BASE = "https://api.assrt.net/v1"
-    _OS_UA = "MoviePilot EmbySubtitleSync/2.8.0"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.9.0"
 
     @staticmethod
     def _to_float(v) -> float:
@@ -1449,6 +1449,96 @@ class EmbySubtitleSync(_PluginBase):
         except Exception:
             return None
 
+    def _resolve_hash_target(self, video_path: str) -> tuple[str | None, str | None, str]:
+        """为 hash 源解析真实目标，返回 (kind, ref, 显示名)：
+        - 本地真实大文件 → ("file", 路径, 文件名)；
+        - .strm 文件 → 读其内容：写的是本地路径（CloudDrive 型，如 /CloudNAS/...）
+          则按原样/经路径映射后找到真实文件 → ("file", ...)；写的是 http(s) 直链
+          （OneStrm 型）→ ("url", 链接, 链接中的文件名)；
+        - 都不可用 → (None, None, 文件名)，hash 源跳过该条目。
+        注：NFO 等元数据文件算不出哈希（哈希来自视频字节本身），只能顺 strm 找真身。"""
+        p = Path(video_path)
+        try:
+            if p.is_file() and p.stat().st_size >= self._HASH_MIN_SIZE:
+                return "file", video_path, p.name
+        except Exception:
+            pass
+        if p.suffix.lower() != ".strm":
+            return None, None, p.name
+        try:
+            lines = p.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+            target = lines[0].strip() if lines else ""
+        except Exception:
+            return None, None, p.name
+        if not target:
+            return None, None, p.name
+        if target.startswith(("http://", "https://")):
+            return "url", target, Path(target.split("?")[0]).name
+        for cand in {target, self._map_path(target)}:
+            if cand and Path(cand).is_file():
+                return "file", cand, Path(cand).name
+        return None, None, p.name
+
+    async def _url_file_size(self, url: str) -> int | None:
+        """用 Range bytes=0-0 探测直链总大小；服务器不支持 Range（非 206）返回 None。"""
+        client = AsyncRequestUtils(headers={"Range": "bytes=0-0"},
+                                   proxies=settings.PROXY or {})
+        try:
+            resp = await client.get_res(url)
+        except Exception:
+            return None
+        if not resp or resp.status_code != 206:
+            return None
+        cr = ""
+        try:
+            cr = resp.headers.get("Content-Range") or ""
+        except Exception:
+            pass
+        m = re.search(r"/(\d+)\s*$", cr)
+        return int(m.group(1)) if m else None
+
+    async def _url_range(self, url: str, start: int, length: int) -> bytes | None:
+        """取直链指定字节段；非 206 或长度不足返回 None。"""
+        client = AsyncRequestUtils(
+            headers={"Range": f"bytes={start}-{start + length - 1}"},
+            proxies=settings.PROXY or {})
+        try:
+            resp = await client.get_res(url)
+        except Exception:
+            return None
+        if not resp or resp.status_code != 206:
+            return None
+        data = resp.content or b""
+        return bytes(data) if len(data) >= length else None
+
+    async def _shooter_hash_url(self, url: str) -> str | None:
+        """直链版 Shooter 哈希：只取 4 段 4KB（共 16KB），不下载整个文件。"""
+        import hashlib
+        size = await self._url_file_size(url)
+        if not size or size < self._HASH_MIN_SIZE:
+            return None
+        parts = []
+        for off in (4096, int(size / 3 * 2), int(size / 3), size - 8192):
+            data = await self._url_range(url, off, 4096)
+            if data is None:
+                return None
+            parts.append(hashlib.md5(data).hexdigest())
+        return ";".join(parts)
+
+    async def _xunlei_cid_url(self, url: str) -> str | None:
+        """直链版迅雷 CID：只取 3 段 20KB（共 60KB），不下载整个文件。"""
+        import hashlib
+        size = await self._url_file_size(url)
+        if not size or size < self._HASH_MIN_SIZE:
+            return None
+        h = hashlib.sha1()
+        for off in (0, size // 3, size - 0x5000):
+            data = await self._url_range(url, off, 0x5000)
+            if data is None:
+                return None
+            h.update(data)
+        return h.hexdigest().upper()
+
     async def _download_extra_file(self, url: str, file_name: str, video_path: str,
                                    lang: str, tv: dict | None, work_dir: Path) -> bool:
         """hash 源共用：下载字幕文件到 work_dir 并落盘到视频旁。"""
@@ -1470,14 +1560,20 @@ class EmbySubtitleSync(_PluginBase):
 
     async def _shooter_fetch(self, video_path: str, lang: str,
                              tv: dict | None = None) -> tuple[bool, str | None]:
-        fhash = self._shooter_hash(video_path)
+        kind, ref, disp_name = self._resolve_hash_target(video_path)
+        if kind == "file":
+            fhash = self._shooter_hash(ref)
+        elif kind == "url":
+            fhash = await self._shooter_hash_url(ref)
+        else:
+            fhash = None
         if not fhash:
-            logger.debug("[EmbySubtitleSync] Shooter 跳过：文件过小或不可读（strm 等）")
+            logger.debug("[EmbySubtitleSync] Shooter 跳过：无可用真实文件目标或哈希计算失败")
             return False, None
         client = AsyncRequestUtils(proxies=settings.PROXY or {})
         resp = await client.post_res(
             "https://www.shooter.cn/api/subapi.php",
-            data={"filehash": fhash, "pathinfo": Path(video_path).name,
+            data={"filehash": fhash, "pathinfo": disp_name,
                   "format": "json", "lang": "Chn"})
         if not resp or resp.status_code != 200:
             logger.warning(f"[EmbySubtitleSync] Shooter 查询失败 HTTP {resp.status_code if resp else 'N/A'}")
@@ -1520,9 +1616,15 @@ class EmbySubtitleSync(_PluginBase):
 
     async def _xunlei_fetch(self, video_path: str, lang: str,
                             tv: dict | None = None) -> tuple[bool, str | None]:
-        cid = self._xunlei_cid(video_path)
+        kind, ref, _disp = self._resolve_hash_target(video_path)
+        if kind == "file":
+            cid = self._xunlei_cid(ref)
+        elif kind == "url":
+            cid = await self._xunlei_cid_url(ref)
+        else:
+            cid = None
         if not cid:
-            logger.debug("[EmbySubtitleSync] 迅雷字幕跳过：文件过小或不可读（strm 等）")
+            logger.debug("[EmbySubtitleSync] 迅雷字幕跳过：无可用真实文件目标或哈希计算失败")
             return False, None
         client = AsyncRequestUtils(proxies=settings.PROXY or {})
         resp = await client.get_res(f"http://sub.xmp.sandai.net:8000/subxl/{cid}.json")
