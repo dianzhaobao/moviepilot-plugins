@@ -41,7 +41,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.9.0"
+    plugin_version = "2.10.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -745,6 +745,19 @@ class EmbySubtitleSync(_PluginBase):
             cn = item.get("Name") or ""
             if cn and cn != name:
                 kws.append(f"{cn} {year}".strip())
+            # v2.10.0 标题拆分变体：中文译名常带「序号+副标题」（移动迷宫3：死亡解药），
+            # 站内字幕常只按主标题/副标题/去序号形式收录，全称搜不到时靠变体兜底
+            for base_title in (cn, name):
+                if not base_title:
+                    continue
+                for v in self._title_variants(base_title):
+                    kw = f"{v} {year}".strip()
+                    if kw not in kws:
+                        kws.append(kw)
+            # 发布名兜底：strm 文件名即真身的发布式文件名，PT 字幕包多按发布名索引
+            stem = Path(item.get("Path") or "").stem
+            if len(stem) >= 8 and stem not in kws:
+                kws.append(stem)
             return [k for k in kws if k]
         # 剧集：系列原名/中文名 + SxxExx
         series = series_item or {}
@@ -1269,6 +1282,140 @@ class EmbySubtitleSync(_PluginBase):
                 tags.add(tag)
         return res, tags
 
+    # ---------------- 标题拆分变体（v2.10.0） ----------------
+    # 经典外语片的中文译名常带「序号+副标题」（移动迷宫3：死亡解药），字幕站
+    # 往往只按主标题、只按副标题或去掉序号的形式收录，全称一搜到底会漏。
+    # ASSRT 等站均为关键词检索、无 ID 检索，变体扇出是唯一的召回手段；
+    # 命中之后仍由 _title_matches + 年份硬校验把关，不放宽误配防线。
+
+    _TITLE_SEPS = "：:—–|/"
+
+    @classmethod
+    def _title_parts(cls, title: str) -> tuple[str, str, str, str]:
+        """拆标题为 (主干, 序号, 副标题, 分隔符)，无对应部分时为空串。
+        序号只认主标题尾部的阿拉伯数字/罗马数字/中文数字；纯数字片名
+        （《1917》）整体不拆，避免把片名本身当成序号。"""
+        t = (title or "").strip()
+        main, sub, sep = t, "", ""
+        for i, ch in enumerate(t):
+            if ch in cls._TITLE_SEPS:
+                main, sub, sep = t[:i].strip(), t[i + 1:].strip(), ch
+                break
+        base, num = main, ""
+        if main and not main.isdigit():
+            m = re.match(r"^(.*?)(\d{1,2}|[IVX]{1,4}|[一二三四五六七八九十]{1,3})$",
+                         main)
+            if m and len(m.group(1).strip()) >= 2:
+                base, num = m.group(1).strip(), m.group(2)
+        return base, num, sub, sep
+
+    @classmethod
+    def _title_variants(cls, title: str) -> list[str]:
+        """生成搜索变体（不含原标题、去重、按精准度排序、上限 4 个）。
+        移动迷宫3：死亡解药 → [移动迷宫3, 移动迷宫：死亡解药, 移动迷宫3死亡解药, 移动迷宫]；
+        玩具总动员4 → [玩具总动员]；白雪公主/1917 → []。"""
+        t = (title or "").strip()
+        if len(t) < 3:
+            return []
+        base, num, sub, sep = cls._title_parts(t)
+        out: list[str] = []
+
+        def _add(v: str) -> None:
+            v = (v or "").strip()
+            if v and v != t and v not in out and len(out) < 4:
+                out.append(v)
+
+        if sub:
+            _add(f"{base}{num}")
+            if num:
+                _add(f"{base}{sep}{sub}")
+            joiner = "" if re.search(r"[\u4e00-\u9fff]", t) else " "
+            _add(f"{base}{num}{joiner}{sub}")
+            if num:
+                _add(base)
+        elif num:
+            _add(base)
+        return out
+
+    @classmethod
+    def _title_match_norms(cls, title: str) -> set[str]:
+        """校验用等价标题集：全称归一化 +（有序号且有副标题时）主干+副标题、
+        主干+序号 两种拆分等价形。裸主干永不入集（只认「移动迷宫」会串到
+        同系列其他部），防蹭逻辑不削弱。"""
+        norms = set()
+        n = cls._norm_title(title or "")
+        if len(n) >= 2:
+            norms.add(n)
+        base, num, sub, _sep = cls._title_parts(title or "")
+        if sub and num:
+            for cand in (f"{base}{sub}", f"{base}{num}"):
+                cn = cls._norm_title(cand)
+                if len(cn) >= 2:
+                    norms.add(cn)
+        return norms
+
+    @staticmethod
+    def _release_group(name: str) -> str:
+        """从发布式文件名提取发布组（结尾的 -GROUP），取不到返回空串。"""
+        stem = Path(name or "").stem
+        m = re.search(r"-([A-Za-z0-9]{2,15})$", stem)
+        return m.group(1).lower() if m else ""
+
+    def _read_sidecar_nfo(self, video_path: str) -> dict:
+        """直读视频同目录的 .nfo（Kodi/Emby 格式），提取 ID/原名/年份/分辨率。
+        CSF 同款做法：Emby 条目未必给全 ProviderIds，NFO 的 <uniqueid> 往往更全，
+        <fileinfo> 里还有真身的分辨率。用正则容错解析（NFO 偶有不规范 XML），
+        读不到返回空 dict，绝不抛异常影响主流程。"""
+        out: dict = {}
+        try:
+            p = Path(video_path)
+            text = ""
+            for c in (p.parent / f"{p.stem}.nfo", p.parent / "movie.nfo",
+                      p.parent / "tvshow.nfo"):
+                if c.is_file():
+                    text = c.read_text(encoding="utf-8", errors="ignore")
+                    break
+            if not text:
+                return out
+            for m in re.finditer(r"<uniqueid\b([^>]*)>([^<]*)</uniqueid>", text):
+                attrs, val = m.group(1), m.group(2).strip()
+                tm = re.search(r'type="(\w+)"', attrs)
+                if not val or not tm:
+                    continue
+                kind = tm.group(1).lower()
+                if kind == "imdb" and val.startswith("tt"):
+                    out.setdefault("imdb", val)
+                elif kind == "tmdb" and val.isdigit():
+                    out.setdefault("tmdb", val)
+            if "imdb" not in out:
+                for tag in ("imdb_id", "imdbid", "id"):
+                    m = re.search(rf"<{tag}>\s*(tt\d+)\s*</{tag}>", text)
+                    if m:
+                        out["imdb"] = m.group(1)
+                        break
+            if "tmdb" not in out:
+                m = re.search(r"<tmdbid>\s*(\d+)\s*</tmdbid>", text)
+                if m:
+                    out["tmdb"] = m.group(1)
+            m = re.search(r"<originaltitle>\s*([^<]+?)\s*</originaltitle>", text)
+            if m:
+                out["original"] = m.group(1)
+            m = re.search(r"<title>\s*([^<]+?)\s*</title>", text)
+            if m:
+                out["title"] = m.group(1)
+            m = re.search(r"<premiered>\s*(\d{4})-\d{2}-\d{2}", text) or \
+                re.search(r"<year>\s*(\d{4})\s*</year>", text)
+            if m:
+                out["year"] = int(m.group(1))
+            m = re.search(r"<width>\s*(\d+)\s*</width>", text)
+            if m:
+                w = int(m.group(1))
+                out["res"] = (2160 if w >= 3000 else 1080 if w >= 1200 else
+                              720 if w >= 900 else 480 if w >= 600 else 0)
+        except Exception:
+            return {}
+        return out
+
     def _title_matches(self, ctx: dict, text: str) -> bool:
         """候选文本是否确实命中目标作品（防《赤发白雪姬》蹭《白雪公主》式误配）：
         - 候选的任一别名分段（按 / | 、,; 分割）归一化后与目标中文名/原名相等 → 命中；
@@ -1278,10 +1425,10 @@ class EmbySubtitleSync(_PluginBase):
         中文名不接受任意包含（"红发的白雪公主"包含"白雪公主"但并非同一作品），
         只接受相等，或以目标名开头且后跟季集/年份后缀（剧集候选的常态）。"""
         targets = set()
-        for t in (ctx.get("name"), ctx.get("original")):
-            n = self._norm_title(t or "")
-            if len(n) >= 2:
-                targets.add(n)
+        for t in (ctx.get("name"), ctx.get("original"), *(ctx.get("alt_titles") or [])):
+            # v2.10.0：并入拆分等价形（移动迷宫：死亡解药 / 移动迷宫3），否则用
+            # 变体搜回来的候选会被这里的全称校验误杀
+            targets |= self._title_match_norms(t or "")
         if not targets:
             return True  # 无标题信息可校验时不拦截
         orig = self._norm_title(ctx.get("original") or "")
@@ -1315,7 +1462,8 @@ class EmbySubtitleSync(_PluginBase):
         return False
 
     def _spec_bonus(self, ctx: dict, text: str) -> float:
-        """版本匹配加分：分辨率同档 +30，版本标签（Remux/BluRay/WEB-DL 等）命中每个 +10。"""
+        """版本匹配加分：分辨率同档 +30，版本标签（Remux/BluRay/WEB-DL 等）命中每个 +10，
+        发布组一致 +15（v2.10.0：发布组从 strm 真身文件名解析，同组字幕时间轴最贴）。"""
         bonus = 0.0
         cres = self._res_bucket(text)
         if ctx.get("res") and cres and cres == ctx["res"]:
@@ -1324,6 +1472,9 @@ class EmbySubtitleSync(_PluginBase):
         for tag in ctx.get("src_tags") or ():
             if tag in low:
                 bonus += 10
+        grp = self._release_group(ctx.get("release_name") or "")
+        if grp and grp in (text or "").lower():
+            bonus += 15
         return bonus
 
     async def _assrt_download_gate(self) -> None:
@@ -1339,15 +1490,18 @@ class EmbySubtitleSync(_PluginBase):
             self._assrt_dl_times = [t for t in self._assrt_dl_times if now - t < 60]
         self._assrt_dl_times.append(now)
 
-    def _extra_ctx(self, item: dict, media_type: str, series_item: dict | None) -> dict:
-        """汇总额外源搜索所需的标题/年份/季集/外部 ID/版本规格。"""
+    def _extra_ctx(self, item: dict, media_type: str, series_item: dict | None,
+                   video_path: str = "") -> dict:
+        """汇总额外源搜索所需的标题/年份/季集/外部 ID/版本规格。
+        v2.10.0：再直读同目录 NFO 补齐 Emby 没给全的 ID/原名/年份/分辨率，
+        并解析 strm 真身的发布名（发布组打分与文件名校验用）。"""
         series = series_item or {}
 
         def _pid(d: dict, key: str):
             return (d.get("ProviderIds") or {}).get(key)
 
         res, tags = self._video_specs(item)
-        return {
+        ctx = {
             "is_tv": media_type == "电视剧",
             "name": item.get("SeriesName") or item.get("Name") or "",
             "original": item.get("OriginalTitle") or series.get("OriginalTitle") or "",
@@ -1359,11 +1513,29 @@ class EmbySubtitleSync(_PluginBase):
             "res": res,
             "src_tags": tags,
         }
+        if video_path:
+            nfo = self._read_sidecar_nfo(video_path)
+            if nfo:
+                ctx["imdb"] = ctx["imdb"] or nfo.get("imdb")
+                ctx["tmdb"] = ctx["tmdb"] or nfo.get("tmdb")
+                if not ctx["year"] and nfo.get("year"):
+                    ctx["year"] = nfo["year"]
+                if not ctx["res"] and nfo.get("res"):
+                    ctx["res"] = nfo["res"]
+                if not ctx["original"] and nfo.get("original"):
+                    ctx["original"] = nfo["original"]
+                alts = [c for c in (nfo.get("original"), nfo.get("title"))
+                        if c and c not in (ctx["name"], ctx["original"])]
+                if alts:
+                    ctx["alt_titles"] = alts
+            _kind, _ref, disp = self._resolve_hash_target(video_path)
+            ctx["release_name"] = disp or Path(video_path).name
+        return ctx
 
     async def _try_extra_sources(self, item: dict, media_type: str, series_item: dict | None,
                                  video_path: str, lang: str) -> tuple[bool, str | None]:
         """站点无果时的兜底入口：依次尝试已启用的额外字幕源。"""
-        ctx = self._extra_ctx(item, media_type, series_item)
+        ctx = self._extra_ctx(item, media_type, series_item, video_path)
         tv = None
         if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
             tv = {"season": int(ctx["season"]), "episode": int(ctx["episode"]),
@@ -1790,6 +1962,23 @@ class EmbySubtitleSync(_PluginBase):
                       dsubs[0] if dsubs else None)
         return detail or {}
 
+    @classmethod
+    def _assrt_queries(cls, ctx: dict) -> list[str]:
+        """ASSRT 查询扇出（v2.10.0）：中文名 → 中文拆分变体 → 原名 → 原名变体，
+        去重封顶 6 条。ASSRT 搜索间隔 ≥4 秒，封顶防一轮被单个条目拖垮；
+        全部查询的候选先汇总再统一打分（既有逻辑），变体只是扩大召回面。"""
+        out: list[str] = []
+        for base in (ctx.get("name"), ctx.get("original")):
+            b = (base or "").strip()
+            if len(b) < 2:
+                continue
+            for q in [b, *cls._title_variants(b)]:
+                if q not in out:
+                    out.append(q)
+                if len(out) >= 6:
+                    return out
+        return out
+
     async def _assrt_fetch(self, ctx: dict, video_path: str, lang: str,
                            tv: dict | None = None) -> tuple[bool, str | None]:
         import time as _time
@@ -1798,11 +1987,7 @@ class EmbySubtitleSync(_PluginBase):
             return False, None
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self._assrt_token}"}
         client = AsyncRequestUtils(headers=headers, proxies=settings.PROXY or {})
-        queries: list[str] = []
-        for q in (ctx["name"], ctx["original"]):
-            q = (q or "").strip()
-            if len(q) >= 2 and q not in queries:
-                queries.append(q)
+        queries = self._assrt_queries(ctx)
         # 两轮查询的候选汇总后统一打分，避免中文查询先命中弱相关结果就提前收工
         pool: dict[str, dict] = {}
         rejected_mismatch = 0
@@ -1916,6 +2101,52 @@ class EmbySubtitleSync(_PluginBase):
 
     # ---------------- OpenSubtitles ----------------
 
+    @staticmethod
+    def _os_hash_from_chunks(size: int, head: bytes, tail: bytes) -> str:
+        """OpenSubtitles moviehash：文件大小 + 首尾各 64KB 按 8 字节小端无符号
+        累加（64 位回绕），输出 16 位十六进制。"""
+        h = size & 0xFFFFFFFFFFFFFFFF
+        for block in (head, tail):
+            for i in range(0, len(block) - 7, 8):
+                h = (h + int.from_bytes(block[i:i + 8], "little")) & 0xFFFFFFFFFFFFFFFF
+        return format(h, "016x")
+
+    def _os_hash_local(self, path: str) -> str | None:
+        """本地真身文件的 moviehash（需 ≥128KB 才有首尾两段可读）。"""
+        try:
+            size = Path(path).stat().st_size
+            if size < 131072:
+                return None
+            with open(path, "rb") as f:
+                head = f.read(65536)
+                f.seek(size - 65536)
+                tail = f.read(65536)
+            if len(head) < 65536 or len(tail) < 65536:
+                return None
+            return self._os_hash_from_chunks(size, head, tail)
+        except Exception:
+            return None
+
+    async def _os_hash_url(self, url: str) -> str | None:
+        """直链真身的 moviehash：只 Range 取首尾共 128KB，不下载整片。"""
+        size = await self._url_file_size(url)
+        if not size or size < 131072:
+            return None
+        head = await self._url_range(url, 0, 65536)
+        tail = await self._url_range(url, size - 65536, 65536)
+        if head is None or tail is None:
+            return None
+        return self._os_hash_from_chunks(size, head, tail)
+
+    async def _os_hash(self, video_path: str) -> str | None:
+        """按 strm 真身类型算 moviehash；真身不可达返回 None（不阻断 ID/标题路线）。"""
+        kind, ref, _disp = self._resolve_hash_target(video_path)
+        if kind == "file":
+            return self._os_hash_local(ref)
+        if kind == "url":
+            return await self._os_hash_url(ref)
+        return None
+
     def _os_headers(self, auth: bool = False) -> dict:
         headers = {
             "Accept": "application/json",
@@ -1997,10 +2228,28 @@ class EmbySubtitleSync(_PluginBase):
                 idp["tmdb_id"] = tmdb_int
         if len(idp) > len(common):
             attempts.append(("id", idp))
-        # 2) 英文标题 + 年份搜索
+        # 1.5) 文件哈希（v2.10.0）：strm 真身可达时按 moviehash 精确匹配；
+        # moviehash_match=include 让哈希命中与其它结果合并而非互斥
+        oshash = await self._os_hash(video_path)
+        if oshash:
+            hp = dict(common)
+            hp["moviehash"] = oshash
+            hp["moviehash_match"] = "include"
+            if ctx["is_tv"] and ctx["season"] is not None:
+                hp["season_number"] = int(ctx["season"])
+                if ctx["episode"] is not None:
+                    hp["episode_number"] = int(ctx["episode"])
+            attempts.append(("hash", hp))
+        # 2) 英文标题 + 年份搜索（含原名拆分变体兜底，总尝试数封顶 5）
+        title_queries: list[str] = []
         if ctx["original"]:
+            title_queries.append(ctx["original"])
+            title_queries.extend(self._title_variants(ctx["original"]))
+        for tq in title_queries:
+            if len(attempts) >= 5:
+                break
             tp = dict(common)
-            tp["query"] = ctx["original"]
+            tp["query"] = tq
             if ctx["year"]:
                 tp["year"] = int(ctx["year"])
             if ctx["is_tv"] and ctx["season"] is not None:
