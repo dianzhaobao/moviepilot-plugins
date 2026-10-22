@@ -41,7 +41,7 @@ class EmbySubtitleSync(_PluginBase):
     # 插件图标
     plugin_icon = "subtitle.png"
     # 插件版本
-    plugin_version = "2.7.0"
+    plugin_version = "2.8.0"
     # 插件作者
     plugin_author = "muse"
     # 作者主页
@@ -99,6 +99,10 @@ class EmbySubtitleSync(_PluginBase):
         # 额外字幕源（v2.3.0，参考 SubtitleAssistant 的源实现）
         self._assrt_enabled = False
         self._assrt_token = ""
+        # hash 字幕源（v2.8.0，算法与 CSF 一致）：按文件哈希精确匹配，无需凭据、默认启用；
+        # 仅对本地真实文件有效，.strm 等小文件自动跳过
+        self._shooter_enabled = True
+        self._xunlei_enabled = True
         self._opensubtitles_enabled = False
         self._os_api_key = ""
         self._os_username = ""
@@ -156,6 +160,10 @@ class EmbySubtitleSync(_PluginBase):
             # 额外字幕源配置
             self._assrt_enabled = config.get("assrt_enabled", False) or False
             self._assrt_token = (config.get("assrt_token") or "").strip()
+            _sh = config.get("shooter_enabled", True)
+            self._shooter_enabled = True if _sh is None else bool(_sh)
+            _xl = config.get("xunlei_enabled", True)
+            self._xunlei_enabled = True if _xl is None else bool(_xl)
             self._opensubtitles_enabled = config.get("opensubtitles_enabled", False) or False
             self._os_api_key = (config.get("os_api_key") or "").strip()
             self._os_username = (config.get("os_username") or "").strip()
@@ -193,6 +201,8 @@ class EmbySubtitleSync(_PluginBase):
             "dry_run": self._dry_run,
             "assrt_enabled": self._assrt_enabled,
             "assrt_token": self._assrt_token,
+            "shooter_enabled": self._shooter_enabled,
+            "xunlei_enabled": self._xunlei_enabled,
             "opensubtitles_enabled": self._opensubtitles_enabled,
             "os_api_key": self._os_api_key,
             "os_username": self._os_username,
@@ -1182,13 +1192,13 @@ class EmbySubtitleSync(_PluginBase):
         return []
 
     # ------------------------------------------------------------------
-    # 额外字幕源（v2.3.0）：ASSRT（射手网） / OpenSubtitles
-    # 接口实现参考 SubtitleAssistant（字幕助手）的 source/assrt.py、source/opensubtitles.py
-    # 站点搜索无果时按 ASSRT → OpenSubtitles 顺序兜底
+    # 额外字幕源：Shooter / 迅雷（v2.8.0，文件哈希源，算法与 CSF 一致）、
+    # ASSRT（射手网）/ OpenSubtitles（v2.3.0，参考 SubtitleAssistant 的源实现）
+    # 站点搜索无果时按 Shooter → 迅雷 → ASSRT → OpenSubtitles 顺序兜底
     # ------------------------------------------------------------------
 
     _ASSRT_BASE = "https://api.assrt.net/v1"
-    _OS_UA = "MoviePilot EmbySubtitleSync/2.7.0"
+    _OS_UA = "MoviePilot EmbySubtitleSync/2.8.0"
 
     @staticmethod
     def _to_float(v) -> float:
@@ -1358,6 +1368,24 @@ class EmbySubtitleSync(_PluginBase):
         if ctx["is_tv"] and ctx["season"] is not None and ctx["episode"] is not None:
             tv = {"season": int(ctx["season"]), "episode": int(ctx["episode"]),
                   "cache_key": f"{self._norm_title(ctx['name'])}|S{int(ctx['season']):02d}"}
+        # hash 源优先（v2.8.0）：按文件哈希命中即与当前文件精确匹配，无标题误配风险；
+        # .strm/小文件算不出哈希会自动跳过，对 strm 库无影响
+        if self._shooter_enabled:
+            try:
+                ok, name = await self._shooter_fetch(video_path, lang, tv=tv)
+            except Exception as e:
+                logger.error(f"[EmbySubtitleSync] Shooter 异常: {e}")
+                ok, name = False, None
+            if ok:
+                return True, name
+        if self._xunlei_enabled:
+            try:
+                ok, name = await self._xunlei_fetch(video_path, lang, tv=tv)
+            except Exception as e:
+                logger.error(f"[EmbySubtitleSync] 迅雷字幕异常: {e}")
+                ok, name = False, None
+            if ok:
+                return True, name
         if self._assrt_enabled and self._assrt_token:
             try:
                 ok, name = await self._assrt_fetch(ctx, video_path, lang, tv=tv)
@@ -1374,6 +1402,174 @@ class EmbySubtitleSync(_PluginBase):
                 ok, name = False, None
             if ok:
                 return True, name
+        return False, None
+
+    # ---------------- hash 字幕源（v2.8.0）：Shooter / 迅雷 ----------------
+    # 两源均按视频文件哈希精确匹配（算法与 ChineseSubFinder 一致），无需凭据。
+    # 文件小于 60KB（含全部 .strm）算不出哈希，直接跳过。
+
+    _HASH_MIN_SIZE = 0xF000
+
+    def _shooter_hash(self, path: str) -> str | None:
+        """Shooter 文件哈希：4 段 4KB 采样（偏移 4096、2/3、1/3、末尾-8KB）的 MD5 以 ; 连接。"""
+        import hashlib
+        try:
+            size = Path(path).stat().st_size
+            if size < self._HASH_MIN_SIZE:
+                return None
+            offsets = [4096, int(size / 3 * 2), int(size / 3), size - 8192]
+            parts = []
+            with open(path, "rb") as f:
+                for off in offsets:
+                    f.seek(off)
+                    data = f.read(4096)
+                    if len(data) < 4096:
+                        return None
+                    parts.append(hashlib.md5(data).hexdigest())
+            return ";".join(parts)
+        except Exception:
+            return None
+
+    def _xunlei_cid(self, path: str) -> str | None:
+        """迅雷 CID：3 段 20KB 采样（偏移 0、1/3、末尾-20KB）拼接后的 SHA1 大写十六进制。"""
+        import hashlib
+        try:
+            size = Path(path).stat().st_size
+            if size < self._HASH_MIN_SIZE:
+                return None
+            h = hashlib.sha1()
+            with open(path, "rb") as f:
+                for off in (0, size // 3, size - 0x5000):
+                    f.seek(off)
+                    data = f.read(0x5000)
+                    if len(data) < 0x5000:
+                        return None
+                    h.update(data)
+            return h.hexdigest().upper()
+        except Exception:
+            return None
+
+    async def _download_extra_file(self, url: str, file_name: str, video_path: str,
+                                   lang: str, tv: dict | None, work_dir: Path) -> bool:
+        """hash 源共用：下载字幕文件到 work_dir 并落盘到视频旁。"""
+        dl = AsyncRequestUtils(proxies=settings.PROXY or {})
+        fres = await dl.get_res(url)
+        if not fres or fres.status_code != 200 or not fres.content:
+            return False
+        tmp = work_dir / Path(file_name).name
+        tmp.write_bytes(fres.content)
+        return self._place_subtitle(tmp, work_dir, video_path, lang, tv=tv)
+
+    @staticmethod
+    def _shooter_lang_ok(desc: str, lang: str) -> bool:
+        """Shooter 按 lang=Chn 查询，desc 是主要语言信号；繁体标记与目标冲突时拒绝。"""
+        d = desc or ""
+        if lang == "简体中文":
+            return not ("繁" in d and "简" not in d and "双语" not in d and "雙語" not in d)
+        return "繁" in d
+
+    async def _shooter_fetch(self, video_path: str, lang: str,
+                             tv: dict | None = None) -> tuple[bool, str | None]:
+        fhash = self._shooter_hash(video_path)
+        if not fhash:
+            logger.debug("[EmbySubtitleSync] Shooter 跳过：文件过小或不可读（strm 等）")
+            return False, None
+        client = AsyncRequestUtils(proxies=settings.PROXY or {})
+        resp = await client.post_res(
+            "https://www.shooter.cn/api/subapi.php",
+            data={"filehash": fhash, "pathinfo": Path(video_path).name,
+                  "format": "json", "lang": "Chn"})
+        if not resp or resp.status_code != 200:
+            logger.warning(f"[EmbySubtitleSync] Shooter 查询失败 HTTP {resp.status_code if resp else 'N/A'}")
+            return False, None
+        try:
+            payload = resp.json()
+        except Exception:
+            return False, None
+        if not isinstance(payload, list):
+            return False, None
+        cands = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            desc = str(entry.get("desc") or "")
+            files = [f for f in (entry.get("files") or [])
+                     if isinstance(f, dict) and f.get("link")]
+            if not files or not self._shooter_lang_ok(desc, lang):
+                continue
+            cands.append((desc, files))
+        # 双语优先，其余保持接口返回顺序（接口本身按匹配度排序）
+        cands.sort(key=lambda c: 0 if ("双语" in c[0] or "雙語" in c[0] or "中英" in c[0]) else 1)
+        for desc, files in cands[:3]:
+            f0 = files[0]
+            ext = str(f0.get("ext") or "srt").lower().lstrip(".")
+            url_name = Path(str(f0["link"]).split("?")[0]).name
+            file_name = url_name if Path(url_name).suffix else f"shooter.{ext}"
+            work_dir = Path(self.get_data_path()) / "downloads" / uuid4().hex
+            work_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if await self._download_extra_file(str(f0["link"]), file_name,
+                                                   video_path, lang, tv, work_dir):
+                    label = desc or file_name
+                    logger.info(f"[EmbySubtitleSync] Shooter 字幕补齐: {label}")
+                    return True, f"[Shooter] {label}"
+            finally:
+                import shutil
+                shutil.rmtree(work_dir, ignore_errors=True)
+        return False, None
+
+    async def _xunlei_fetch(self, video_path: str, lang: str,
+                            tv: dict | None = None) -> tuple[bool, str | None]:
+        cid = self._xunlei_cid(video_path)
+        if not cid:
+            logger.debug("[EmbySubtitleSync] 迅雷字幕跳过：文件过小或不可读（strm 等）")
+            return False, None
+        client = AsyncRequestUtils(proxies=settings.PROXY or {})
+        resp = await client.get_res(f"http://sub.xmp.sandai.net:8000/subxl/{cid}.json")
+        if not resp or resp.status_code != 200:
+            logger.warning(f"[EmbySubtitleSync] 迅雷字幕查询失败 HTTP {resp.status_code if resp else 'N/A'}")
+            return False, None
+        try:
+            payload = resp.json()
+        except Exception:
+            return False, None
+        sublist = (payload or {}).get("sublist") or []
+        cands = []
+        for v in sublist:
+            if not isinstance(v, dict) or not v.get("scid") or not v.get("surl"):
+                continue
+            sname = str(v.get("sname") or "")
+            suffix = Path(sname).suffix.lower()
+            if suffix not in self._SUBTITLE_EXTS and suffix not in (".zip", ".rar", ".7z"):
+                continue
+            langv = str(v.get("language") or "")
+            low_name = sname.lower()
+            is_trad = "繁" in langv or "繁" in sname or ".cht" in low_name
+            is_simp = "简" in langv or "简" in sname or ".chs" in low_name
+            is_bi = any(m in langv or m in sname for m in ("双语", "雙語", "中英"))
+            if lang == "简体中文":
+                if is_trad and not is_simp and not is_bi:
+                    continue
+                tier = 0 if (is_simp or is_bi) else 1  # 语言未知排后备
+            else:
+                if is_simp and not is_trad and not is_bi:
+                    continue
+                tier = 0 if (is_trad or is_bi) else 1
+            cands.append({"sname": sname, "surl": str(v["surl"]), "tier": tier,
+                          "bilingual": is_bi, "svote": self._to_float(v.get("svote"))})
+        # 语言档内：双语优先，其次按投票数（svote）降序
+        cands.sort(key=lambda c: (c["tier"], 0 if c["bilingual"] else 1, -c["svote"]))
+        for c in cands[:3]:
+            work_dir = Path(self.get_data_path()) / "downloads" / uuid4().hex
+            work_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if await self._download_extra_file(c["surl"], c["sname"],
+                                                   video_path, lang, tv, work_dir):
+                    logger.info(f"[EmbySubtitleSync] 迅雷字幕补齐: {c['sname']}")
+                    return True, f"[迅雷] {c['sname']}"
+            finally:
+                import shutil
+                shutil.rmtree(work_dir, ignore_errors=True)
         return False, None
 
     # ---------------- ASSRT（射手网） ----------------
@@ -1942,6 +2138,13 @@ class EmbySubtitleSync(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            self._col(6, "VSwitch", {"model": "shooter_enabled", "label": "启用 Shooter 字幕（文件哈希精确匹配，仅本地真实文件，strm 自动跳过）"}),
+                            self._col(6, "VSwitch", {"model": "xunlei_enabled", "label": "启用迅雷字幕（文件哈希精确匹配，仅本地真实文件，strm 自动跳过）"}),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             self._col(3, "VSwitch", {"model": "assrt_enabled", "label": "启用 ASSRT（射手网）兜底"}),
                             self._col(9, "VTextField", {
                                 "model": "assrt_token",
@@ -1988,6 +2191,8 @@ class EmbySubtitleSync(_PluginBase):
             "clear_processed": False,
             "clear_history": False,
             "dry_run": True,
+            "shooter_enabled": True,
+            "xunlei_enabled": True,
             "assrt_enabled": False,
             "assrt_token": "",
             "opensubtitles_enabled": False,
